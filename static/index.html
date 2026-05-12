@@ -159,9 +159,12 @@ function StockTracker() {
   const [priceError,   setPriceError]   = useState('');
   const [currentPrices, setCurrentPrices] = useState({});
   const [news,         setNews]         = useState([]);
-  const [newsLoading,  setNewsLoading]  = useState(false);  // {code: {close, change, changePct, loading}}
+  const [newsLoading,  setNewsLoading]  = useState(false);
+  const [marketIndex,  setMarketIndex]  = useState(null);
+  const [fundamentals, setFundamentals] = useState(null);
   const searchRef = useRef(null);
   const refreshTimer = useRef(null);
+  const indexTimer = useRef(null);
 
   // 초기 로드
   useEffect(() => {
@@ -189,6 +192,20 @@ function StockTracker() {
         setCurrentPrices(prev => ({ ...prev, [s.c]: { ...prev[s.c], loading: false } }));
       }
     }));
+  }, []);
+
+  // 시장 지수 조회 (앱 시작 시 + 5분마다)
+  const loadMarketIndex = useCallback(async () => {
+    try {
+      const res = await fetch('/api/index');
+      if (res.ok) setMarketIndex(await res.json());
+    } catch {}
+  }, []);
+
+  useEffect(() => {
+    loadMarketIndex();
+    indexTimer.current = setInterval(loadMarketIndex, 300000);
+    return () => clearInterval(indexTimer.current);
   }, []);
 
   // 리스트 화면일 때 현재가 조회 + 60초마다 자동 갱신
@@ -263,10 +280,18 @@ function StockTracker() {
     setNewsLoading(false);
   }, []);
 
+  const loadFundamentals = useCallback(async (stock) => {
+    setFundamentals(null);
+    try {
+      const res = await fetch(`/api/financials/${stock.c}`);
+      if (res.ok) setFundamentals(await res.json());
+    } catch {}
+  }, []);
+
   const openDetail = stock => {
     setSelected(stock); setPriceData(null); setPriceError('');
-    setNews([]); setPeriod('1M'); setScreen('detail');
-    loadPrices(stock, '1M'); loadNews(stock);
+    setNews([]); setFundamentals(null); setPeriod('1M'); setScreen('detail');
+    loadPrices(stock, '1M'); loadNews(stock); loadFundamentals(stock);
   };
 
   const changePeriod = p => { setPeriod(p); loadPrices(selected, p); };
@@ -392,6 +417,23 @@ function StockTracker() {
           </div>
         )}
 
+        {/* 재무 핵심 지표 */}
+        {(fundamentals || !priceLoading) && (
+          <div className="grid grid-cols-4 gap-2">
+            {[
+              { label: 'PER', value: fundamentals?.per != null ? fundamentals.per.toFixed(2) + 'x' : '-' },
+              { label: 'PBR', value: fundamentals?.pbr != null ? fundamentals.pbr.toFixed(2) + 'x' : '-' },
+              { label: '시가총액', value: (() => { const m = fundamentals?.marcap; if (m == null) return '-'; return m >= 10000 ? (m/10000).toFixed(1) + '조' : fp(m) + '억'; })() },
+              { label: '배당률', value: fundamentals?.div != null ? fundamentals.div.toFixed(2) + '%' : '-' },
+            ].map(({ label, value }) => (
+              <div key={label} className="border-2 border-stone-200 bg-white p-3 text-center">
+                <div className="text-[10px] tracking-widest text-stone-400 mb-1">{label}</div>
+                <div className="mono text-sm font-bold text-stone-800">{value}</div>
+              </div>
+            ))}
+          </div>
+        )}
+
         {latest && !priceLoading && (
           <>
             <div className="bg-stone-900 text-white p-5">
@@ -478,6 +520,31 @@ function StockTracker() {
                   className="flex items-center gap-1.5 text-xs font-bold bg-stone-900 text-white px-4 py-2.5 active:bg-stone-700">
             <Search size={14}/> 종목 추가
           </button>
+        </div>
+        {/* 시장 지수 바 */}
+        <div className="border-t border-stone-100 px-4 py-2 flex gap-4">
+          {[
+            { key: 'kospi', label: 'KOSPI' },
+            { key: 'kosdaq', label: 'KOSDAQ' },
+          ].map(({ key, label }) => {
+            const idx = marketIndex?.[key];
+            return (
+              <div key={key} className="flex items-center gap-2">
+                <span className="text-[10px] tracking-widest text-stone-400 font-bold">{label}</span>
+                {idx
+                  ? <>
+                      <span className={`mono text-sm font-bold ${cc(idx.change)}`}>
+                        {new Intl.NumberFormat('ko-KR', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(idx.value)}
+                      </span>
+                      <span className={`mono text-xs ${cc(idx.change)}`}>
+                        {idx.change > 0 ? '+' : ''}{idx.changePct.toFixed(2)}%
+                      </span>
+                    </>
+                  : <span className="mono text-sm text-stone-300">-</span>
+                }
+              </div>
+            );
+          })}
         </div>
       </header>
 

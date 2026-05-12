@@ -65,6 +65,12 @@ CURRENT_CACHE_TTL = 30  # 30초
 _news_cache: dict = {}
 NEWS_CACHE_TTL = 600  # 10분
 
+_fundamentals_cache: dict = {}
+FUNDAMENTALS_CACHE_TTL = 600  # 10분
+
+_index_cache: dict = {}
+INDEX_CACHE_TTL = 300  # 5분
+
 NAVER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15"
 }
@@ -113,6 +119,129 @@ async def get_current_price(code: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"현재가 조회 실패: {e}")
     _current_cache[code] = (time.time(), data)
+    return data
+
+
+def _fetch_naver_fundamentals(code: str) -> dict:
+    import re
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return {"per": None, "pbr": None, "marcap": None, "div": None}
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://finance.naver.com/",
+    }
+    res = requests.get(
+        f"https://finance.naver.com/item/sise.naver?code={code}",
+        headers=headers,
+        timeout=5,
+    )
+    res.raise_for_status()
+    res.encoding = "euc-kr"
+    soup = BeautifulSoup(res.text, "html.parser")
+
+    def clean(s):
+        return s.replace(",", "").replace("+", "").strip() if s else ""
+
+    result = {"per": None, "pbr": None, "marcap": None, "div": None}
+
+    # PER
+    per_th = soup.find("th", string="PER")
+    if per_th:
+        td = per_th.find_next_sibling("td")
+        if td:
+            try:
+                result["per"] = float(clean((td.find("em") or td).get_text(strip=True)))
+            except Exception:
+                pass
+
+    # PBR
+    for th in soup.find_all("th"):
+        if th.get_text(strip=True).startswith("PBR"):
+            td = th.find_next_sibling("td")
+            if td:
+                try:
+                    result["pbr"] = float(clean((td.find("em") or td).get_text(strip=True)))
+                except Exception:
+                    pass
+            break
+
+    # 시가총액 (억 단위)
+    for th in soup.find_all("th"):
+        if "시가총액" in th.get_text():
+            td = th.find_next_sibling("td")
+            if td:
+                m = re.search(r"([\d,]+)억", td.get_text(strip=True))
+                if m:
+                    result["marcap"] = int(m.group(1).replace(",", ""))
+                    break
+
+    # 배당수익률
+    for th in soup.find_all("th"):
+        if "배당수익률" in th.get_text():
+            td = th.find_next_sibling("td")
+            if td:
+                m = re.search(r"([\d.]+)%", td.get_text(strip=True))
+                if m:
+                    result["div"] = float(m.group(1))
+            break
+
+    return result
+
+
+@app.get("/api/financials/{code}")
+async def get_financials(code: str):
+    if code in _fundamentals_cache:
+        ts, data = _fundamentals_cache[code]
+        if time.time() - ts < FUNDAMENTALS_CACHE_TTL:
+            return data
+    loop = asyncio.get_event_loop()
+    try:
+        data = await loop.run_in_executor(None, lambda: _fetch_naver_fundamentals(code))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"재무 지표 조회 실패: {e}")
+    _fundamentals_cache[code] = (time.time(), data)
+    return data
+
+
+def _fetch_index_data() -> dict:
+    result = {}
+    for naver_code, key in [("KOSPI", "kospi"), ("KOSDAQ", "kosdaq")]:
+        try:
+            res = requests.get(
+                f"https://m.stock.naver.com/api/index/{naver_code}/basic",
+                headers=NAVER_HEADERS,
+                timeout=5,
+            )
+            res.raise_for_status()
+            j = res.json()
+
+            def clean(s):
+                return str(s).replace(",", "").replace("+", "").strip()
+
+            value = round(float(clean(j.get("closePrice", "0"))), 2)
+            change = round(float(clean(j.get("compareToPreviousClosePrice", "0"))), 2)
+            change_pct = round(float(clean(j.get("fluctuationsRatio", "0"))), 2)
+            result[key] = {"value": value, "change": change, "changePct": change_pct}
+        except Exception:
+            result[key] = None
+    return result
+
+
+@app.get("/api/index")
+async def get_market_index():
+    if "data" in _index_cache:
+        ts, data = _index_cache["data"]
+        if time.time() - ts < INDEX_CACHE_TTL:
+            return data
+    loop = asyncio.get_event_loop()
+    try:
+        data = await loop.run_in_executor(None, _fetch_index_data)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"지수 조회 실패: {e}")
+    _index_cache["data"] = (time.time(), data)
     return data
 
 
