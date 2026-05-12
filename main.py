@@ -342,6 +342,10 @@ async def get_financials(code: str):
 
 def _get_kis_token() -> str:
     """KIS OAuth 토큰 반환. 파일 캐시로 서버 재시작 시에도 재활용 (분당 1회 발급 제한 우회)."""
+    app_key = os.environ.get("KIS_APP_KEY") or KIS_APP_KEY
+    app_secret = os.environ.get("KIS_APP_SECRET") or KIS_APP_SECRET
+    if not app_key or not app_secret:
+        raise RuntimeError("KIS_APP_KEY / KIS_APP_SECRET 환경변수 미설정")
     # 1) 메모리 캐시 유효
     if time.time() < _kis_token["expires_at"] - 300 and _kis_token["token"]:
         return _kis_token["token"]
@@ -359,7 +363,7 @@ def _get_kis_token() -> str:
     # 3) 새 토큰 발급
     r = requests.post(
         f"{KIS_BASE_URL}/oauth2/tokenP",
-        json={"grant_type": "client_credentials", "appkey": KIS_APP_KEY, "appsecret": KIS_APP_SECRET},
+        json={"grant_type": "client_credentials", "appkey": app_key, "appsecret": app_secret},
         headers={"content-type": "application/json"},
         timeout=10,
     )
@@ -415,9 +419,25 @@ def _fetch_kis_investor(code: str) -> dict:
 
 
 
+@app.get("/api/kis/check")
+async def kis_check():
+    """KIS 환경변수 로드 여부 확인 (키 값은 노출하지 않음)"""
+    key = os.environ.get("KIS_APP_KEY", "")
+    sec = os.environ.get("KIS_APP_SECRET", "")
+    return {
+        "KIS_APP_KEY_set": bool(key),
+        "KIS_APP_KEY_len": len(key),
+        "KIS_APP_SECRET_set": bool(sec),
+        "KIS_APP_SECRET_len": len(sec),
+        "module_key_set": bool(KIS_APP_KEY),
+    }
+
+
 @app.get("/api/investor/{code}")
 async def get_investor(code: str):
-    if not KIS_APP_KEY or not KIS_APP_SECRET:
+    app_key = os.environ.get("KIS_APP_KEY", "") or KIS_APP_KEY
+    app_secret = os.environ.get("KIS_APP_SECRET", "") or KIS_APP_SECRET
+    if not app_key or not app_secret:
         raise HTTPException(status_code=503, detail="KIS API 키 미설정")
     if code in _investor_cache:
         ts, data = _investor_cache[code]
