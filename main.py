@@ -1,5 +1,5 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 import FinanceDataReader as fdr
@@ -10,8 +10,49 @@ import pandas as pd
 import requests
 import xml.etree.ElementTree as ET
 from urllib.parse import quote
+import os, json, hashlib
 
 _stock_db: list[dict] = []
+
+# ── VAPID 키 관리 ─────────────────────────────────────────────────
+VAPID_KEYS_FILE = ".vapid_keys"
+
+def _load_or_create_vapid_keys() -> tuple[str, str]:
+    """Returns (public_key_urlsafe_b64, private_key_pem)"""
+    import base64 as _b64
+    pub = os.environ.get("VAPID_PUBLIC_KEY")
+    priv_env = os.environ.get("VAPID_PRIVATE_KEY")
+    if pub and priv_env:
+        # env var에 \n 리터럴이 있을 경우 실제 줄바꿈으로 변환
+        priv = priv_env.replace("\\n", "\n")
+        return pub, priv
+    if os.path.exists(VAPID_KEYS_FILE):
+        with open(VAPID_KEYS_FILE) as f:
+            d = json.load(f)
+            return d["public"], d["private"]
+    from py_vapid import Vapid
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+    v = Vapid()
+    v.generate_keys()
+    pub_raw = v._public_key.public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
+    pub = _b64.urlsafe_b64encode(pub_raw).rstrip(b"=").decode()
+    priv = v.private_pem().decode()
+    # env var용: 줄바꿈을 \n 리터럴로 변환
+    priv_escaped = priv.replace("\n", "\\n")
+    with open(VAPID_KEYS_FILE, "w") as f:
+        json.dump({"public": pub, "private": priv}, f)
+    print("[VAPID] 새 키 생성됨. Render 환경변수에 아래 두 값을 등록하세요:")
+    print(f"  VAPID_PUBLIC_KEY = {pub}")
+    print(f"  VAPID_PRIVATE_KEY = {priv_escaped}")
+    return pub, priv
+
+_vapid_public: str = ""
+_vapid_private: str = ""
+
+# ── Push 구독 저장소 ──────────────────────────────────────────────
+# {endpoint_hash: {"sub": {...}, "alerts": {code: {"target": int|None, "stopLoss": int|None, "bigMove": bool}}}}
+_push_subs: dict[str, dict] = {}
+_fired: set = set()  # "hash:code:type:YYYYMMDD"
 
 def _load_listing(market: str) -> list[dict]:
     df = fdr.StockListing(market)
@@ -31,9 +72,72 @@ def _load_listing(market: str) -> list[dict]:
         and str(row[code_col]).strip()
     ]
 
+async def _alert_worker():
+    while True:
+        await asyncio.sleep(60)
+        if not _push_subs:
+            continue
+        codes = {code for v in _push_subs.values() for code in v["alerts"]}
+        if not codes:
+            continue
+
+        loop = asyncio.get_event_loop()
+        prices: dict[str, dict] = {}
+        for code in codes:
+            try:
+                data = await loop.run_in_executor(None, lambda c=code: _fetch_naver_current(c))
+                prices[code] = data
+            except Exception:
+                pass
+
+        today = datetime.now().strftime("%Y%m%d")
+        for ep_hash, info in list(_push_subs.items()):
+            stock_names = {s["c"]: s["n"] for s in _stock_db}
+            for code, rule in info["alerts"].items():
+                cp = prices.get(code)
+                if not cp:
+                    continue
+                price = cp["close"]
+                change_pct = cp["changePct"]
+                name = stock_names.get(code, code)
+                _check_and_push(ep_hash, info["sub"], code, name, rule, price, change_pct, today)
+
+
+def _check_and_push(ep_hash, sub, code, name, rule, price, change_pct, today):
+    from pywebpush import webpush, WebPushException
+
+    def send(tag, title, body):
+        key = f"{ep_hash}:{code}:{tag}:{today}"
+        if key in _fired:
+            return
+        _fired.add(key)
+        try:
+            webpush(
+                subscription_info=sub,
+                data=json.dumps({"title": title, "body": body, "tag": tag}),
+                vapid_private_key=_vapid_private,
+                vapid_claims={"sub": "mailto:stock-alert@example.com"},
+            )
+        except WebPushException as e:
+            if "410" in str(e) or "404" in str(e):
+                _push_subs.pop(ep_hash, None)
+
+    target = rule.get("target")
+    stop_loss = rule.get("stopLoss")
+    big_move = rule.get("bigMove", False)
+
+    if target and price >= target:
+        send("target", f"🎯 목표가 도달 — {name}", f"현재가 ₩{price:,} (목표 ₩{target:,})")
+    if stop_loss and price <= stop_loss:
+        send("stopLoss", f"⚠️ 손절가 도달 — {name}", f"현재가 ₩{price:,} (손절 ₩{stop_loss:,})")
+    if big_move and abs(change_pct) >= 5:
+        sign = "+" if change_pct > 0 else ""
+        send("bigMove", f"📊 급등락 경보 — {name}", f"현재가 ₩{price:,}  {sign}{change_pct:.2f}%")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _stock_db
+    global _stock_db, _vapid_public, _vapid_private
     print("KRX 전종목 목록 로딩 중...")
     loop = asyncio.get_event_loop()
     try:
@@ -46,7 +150,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"종목 목록 로드 실패: {e}")
 
+    try:
+        _vapid_public, _vapid_private = _load_or_create_vapid_keys()
+        print(f"[VAPID] 공개키: {_vapid_public[:20]}...")
+    except Exception as e:
+        print(f"[VAPID] 키 로드 실패: {e}")
+
+    task = asyncio.create_task(_alert_worker())
     yield
+    task.cancel()
 
 
 app = FastAPI(title="한국 주식 트래커", lifespan=lifespan)
@@ -243,6 +355,34 @@ async def get_market_index():
         raise HTTPException(status_code=500, detail=f"지수 조회 실패: {e}")
     _index_cache["data"] = (time.time(), data)
     return data
+
+
+@app.get("/api/push/key")
+async def get_vapid_key():
+    if not _vapid_public:
+        raise HTTPException(status_code=503, detail="VAPID 키 미설정")
+    return {"publicKey": _vapid_public}
+
+
+@app.post("/api/push/subscribe")
+async def push_subscribe(request: Request):
+    body = await request.json()
+    sub = body.get("subscription")
+    alerts = body.get("alerts", {})
+    if not sub or not sub.get("endpoint"):
+        raise HTTPException(status_code=400, detail="subscription 필드 누락")
+    ep_hash = hashlib.sha256(sub["endpoint"].encode()).hexdigest()[:16]
+    _push_subs[ep_hash] = {"sub": sub, "alerts": alerts}
+    return {"ok": True, "hash": ep_hash}
+
+
+@app.post("/api/push/unsubscribe")
+async def push_unsubscribe(request: Request):
+    body = await request.json()
+    endpoint = body.get("endpoint", "")
+    ep_hash = hashlib.sha256(endpoint.encode()).hexdigest()[:16]
+    _push_subs.pop(ep_hash, None)
+    return {"ok": True}
 
 
 @app.get("/api/news/{code}")

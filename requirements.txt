@@ -3,3 +3,4 @@ uvicorn[standard]
 finance-datareader
 pandas
 beautifulsoup4
+pywebpush

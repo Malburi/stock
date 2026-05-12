@@ -21,7 +21,15 @@
 <body>
 <div id="root"></div>
 <script type="text/babel">
-const { useState, useEffect, useRef, useCallback } = React;
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
+
+// ── VAPID urlBase64 변환 ───────────────────────────────────────────
+function urlBase64ToUint8Array(base64String) {
+  const padding = '='.repeat((4 - base64String.length % 4) % 4);
+  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const rawData = atob(base64);
+  return Uint8Array.from([...rawData].map(c => c.charCodeAt(0)));
+}
 
 // ── 아이콘 ────────────────────────────────────────────────────────
 const Ico = ({ size=20, className="", children }) => (
@@ -100,7 +108,8 @@ function PriceChart({ data }) {
 }
 
 // ── 상수 / 유틸 ───────────────────────────────────────────────────
-const STORAGE_KEY = 'stocks:watchlist:v3';
+const STORAGE_KEY  = 'stocks:watchlist:v3';
+const ALERTS_KEY   = 'stocks:alerts:v1';
 const PERIODS = [
   { key: '1M', label: '1개월' },
   { key: '3M', label: '3개월' },
@@ -162,9 +171,14 @@ function StockTracker() {
   const [newsLoading,  setNewsLoading]  = useState(false);
   const [marketIndex,  setMarketIndex]  = useState(null);
   const [fundamentals, setFundamentals] = useState(null);
+  const [alerts,       setAlerts]       = useState(() => ls.get(ALERTS_KEY) || {});
+  // alertDraft: 상세화면에서 편집 중인 임시값
+  const [alertDraft,   setAlertDraft]   = useState(null);
+  const [pushStatus,   setPushStatus]   = useState('idle'); // idle|requesting|ok|error
   const searchRef = useRef(null);
   const refreshTimer = useRef(null);
   const indexTimer = useRef(null);
+  const swRegRef = useRef(null);
 
   // 초기 로드
   useEffect(() => {
@@ -192,6 +206,43 @@ function StockTracker() {
         setCurrentPrices(prev => ({ ...prev, [s.c]: { ...prev[s.c], loading: false } }));
       }
     }));
+  }, []);
+
+  // ── Push 구독 등록 ──────────────────────────────────────────────
+  const registerPush = useCallback(async (currentAlerts) => {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
+    try {
+      let reg = swRegRef.current;
+      if (!reg) {
+        reg = await navigator.serviceWorker.register('/sw.js');
+        swRegRef.current = reg;
+      }
+      const perm = await Notification.requestPermission();
+      if (perm !== 'granted') return;
+      setPushStatus('requesting');
+      const keyRes = await fetch('/api/push/key');
+      if (!keyRes.ok) return;
+      const { publicKey } = await keyRes.json();
+      const sub = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(publicKey),
+      });
+      await fetch('/api/push/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ subscription: sub.toJSON(), alerts: currentAlerts }),
+      });
+      setPushStatus('ok');
+    } catch (e) {
+      setPushStatus('error');
+    }
+  }, []);
+
+  // 앱 시작 시 SW 등록 (알림 설정이 있으면 자동 구독)
+  useEffect(() => {
+    const saved = ls.get(ALERTS_KEY) || {};
+    const hasAny = Object.values(saved).some(r => r.target || r.stopLoss || r.bigMove);
+    if (hasAny) registerPush(saved);
   }, []);
 
   // 시장 지수 조회 (앱 시작 시 + 5분마다)
@@ -291,7 +342,33 @@ function StockTracker() {
   const openDetail = stock => {
     setSelected(stock); setPriceData(null); setPriceError('');
     setNews([]); setFundamentals(null); setPeriod('1M'); setScreen('detail');
+    const saved = (ls.get(ALERTS_KEY) || {})[stock.c] || {};
+    setAlertDraft({
+      target:   saved.target   ? String(saved.target)   : '',
+      stopLoss: saved.stopLoss ? String(saved.stopLoss) : '',
+      bigMove:  saved.bigMove  ?? false,
+    });
     loadPrices(stock, '1M'); loadNews(stock); loadFundamentals(stock);
+  };
+
+  const saveAlert = () => {
+    const rule = {
+      target:   alertDraft.target   ? parseInt(alertDraft.target.replace(/,/g, ''))   : null,
+      stopLoss: alertDraft.stopLoss ? parseInt(alertDraft.stopLoss.replace(/,/g, '')) : null,
+      bigMove:  alertDraft.bigMove,
+    };
+    const next = { ...(ls.get(ALERTS_KEY) || {}), [selected.c]: rule };
+    ls.set(ALERTS_KEY, next);
+    setAlerts(next);
+    registerPush(next);
+  };
+
+  const clearAlert = () => {
+    const next = { ...(ls.get(ALERTS_KEY) || {}) };
+    delete next[selected.c];
+    ls.set(ALERTS_KEY, next);
+    setAlerts(next);
+    setAlertDraft({ target: '', stopLoss: '', bigMove: false });
   };
 
   const changePeriod = p => { setPeriod(p); loadPrices(selected, p); };
@@ -480,6 +557,59 @@ function StockTracker() {
               </div>
             )}
 
+            {/* 알림 설정 */}
+            {alertDraft && (
+              <div className="border-2 border-stone-900">
+                <div className="border-b-2 border-stone-900 px-4 py-3 flex items-center justify-between">
+                  <div className="text-xs font-bold tracking-widest">알림 설정</div>
+                  <span className="text-base">🔔</span>
+                </div>
+                <div className="p-4 space-y-3">
+                  <div className="flex items-center gap-2">
+                    <label className="mono text-xs text-stone-500 w-16 shrink-0">목표가</label>
+                    <input
+                      type="number" placeholder="0"
+                      value={alertDraft.target}
+                      onChange={e => setAlertDraft(d => ({ ...d, target: e.target.value }))}
+                      className="flex-1 border-2 border-stone-200 px-3 py-2 mono text-sm focus:border-stone-900 outline-none"
+                    />
+                    <span className="mono text-xs text-stone-400">원</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <label className="mono text-xs text-stone-500 w-16 shrink-0">손절가</label>
+                    <input
+                      type="number" placeholder="0"
+                      value={alertDraft.stopLoss}
+                      onChange={e => setAlertDraft(d => ({ ...d, stopLoss: e.target.value }))}
+                      className="flex-1 border-2 border-stone-200 px-3 py-2 mono text-sm focus:border-stone-900 outline-none"
+                    />
+                    <span className="mono text-xs text-stone-400">원</span>
+                  </div>
+                  <div className="flex items-center justify-between py-1">
+                    <span className="mono text-xs text-stone-500">급등락 경보 (±5%)</span>
+                    <button
+                      onClick={() => setAlertDraft(d => ({ ...d, bigMove: !d.bigMove }))}
+                      className={`w-12 h-6 rounded-full transition-colors relative ${alertDraft.bigMove ? 'bg-stone-900' : 'bg-stone-300'}`}
+                    >
+                      <span className={`absolute top-1 w-4 h-4 bg-white rounded-full transition-transform ${alertDraft.bigMove ? 'translate-x-7' : 'translate-x-1'}`}/>
+                    </button>
+                  </div>
+                  <div className="flex gap-2 pt-1">
+                    <button onClick={saveAlert}
+                            className="flex-1 py-2.5 text-xs font-bold bg-stone-900 text-white active:bg-stone-700">
+                      저장
+                    </button>
+                    <button onClick={clearAlert}
+                            className="px-4 py-2.5 text-xs font-bold border-2 border-stone-300 text-stone-500 active:border-stone-900">
+                      해제
+                    </button>
+                  </div>
+                  {pushStatus === 'ok' && <div className="mono text-[10px] text-stone-400 text-center">알림 등록 완료</div>}
+                  {pushStatus === 'error' && <div className="mono text-[10px] text-red-400 text-center">알림 등록 실패 (브라우저 권한 확인)</div>}
+                </div>
+              </div>
+            )}
+
             {/* 관련 뉴스 */}
             <div className="border-2 border-stone-900">
               <div className="border-b-2 border-stone-900 px-4 py-3 flex justify-between items-center">
@@ -572,7 +702,10 @@ function StockTracker() {
                         <div className="flex items-stretch bg-white border-2 border-stone-200 active:border-stone-900 transition-colors">
                           <button className="flex-1 text-left px-4 py-4 min-w-0" onClick={() => openDetail(s)}>
                             <div className="flex items-center justify-between gap-2">
-                              <div className="font-bold text-base truncate">{s.n}</div>
+                              <div className="font-bold text-base truncate flex items-center gap-1">
+                              {s.n}
+                              {(() => { const a = alerts[s.c]; return (a?.target || a?.stopLoss || a?.bigMove) ? <span className="text-xs">🔔</span> : null; })()}
+                            </div>
                               {cp?.loading
                                 ? <Loader2 size={14} className="animate-spin text-stone-300 shrink-0"/>
                                 : cp?.close
