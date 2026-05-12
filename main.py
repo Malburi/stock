@@ -261,7 +261,9 @@ def _fetch_fundamentals(code: str) -> dict:
     }
 
     # ── 1. KIS inquire-price (PER, PBR, 시가총액, 52주 고저, 외국인 소진율) ──
-    if KIS_APP_KEY and KIS_APP_SECRET:
+    _key = os.environ.get("KIS_APP_KEY") or KIS_APP_KEY
+    _sec = os.environ.get("KIS_APP_SECRET") or KIS_APP_SECRET
+    if _key and _sec:
         try:
             token = _get_kis_token()
             r = requests.get(
