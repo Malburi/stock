@@ -4,3 +4,4 @@ finance-datareader
 pandas
 beautifulsoup4
 pywebpush
+python-dotenv

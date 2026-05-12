@@ -11,6 +11,11 @@ import requests
 import xml.etree.ElementTree as ET
 from urllib.parse import quote
 import os, json, hashlib
+# .env 로드 (python-dotenv 없어도 동작, 있으면 env var 자동 주입)
+try:
+    from dotenv import load_dotenv; load_dotenv()
+except ImportError:
+    pass
 
 _stock_db: list[dict] = []
 
@@ -183,6 +188,17 @@ FUNDAMENTALS_CACHE_TTL = 600  # 10분
 _index_cache: dict = {}
 INDEX_CACHE_TTL = 300  # 5분
 
+_investor_cache: dict = {}
+INVESTOR_CACHE_TTL = 300  # 5분
+
+# ── KIS OpenAPI 설정 ──────────────────────────────────────────────
+KIS_APP_KEY    = os.environ.get("KIS_APP_KEY", "")
+KIS_APP_SECRET = os.environ.get("KIS_APP_SECRET", "")
+KIS_BASE_URL   = "https://openapi.koreainvestment.com:9443"
+
+_KIS_TOKEN_FILE = ".kis_token"
+_kis_token: dict = {"token": "", "expires_at": 0}  # 메모리 캐시 (재시작 시 파일에서 복원)
+
 NAVER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15"
 }
@@ -234,71 +250,77 @@ async def get_current_price(code: str):
     return data
 
 
-def _fetch_naver_fundamentals(code: str) -> dict:
+def _fetch_fundamentals(code: str) -> dict:
+    """KIS inquire-price 우선, 실패 시 Naver fallback."""
     import re
-    try:
-        from bs4 import BeautifulSoup
-    except ImportError:
-        return {"per": None, "pbr": None, "marcap": None, "div": None}
+    from bs4 import BeautifulSoup
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": "https://finance.naver.com/",
+    result = {
+        "per": None, "pbr": None, "marcap": None, "div": None,
+        "high52": None, "low52": None, "foreign_ratio": None,
     }
-    res = requests.get(
-        f"https://finance.naver.com/item/sise.naver?code={code}",
-        headers=headers,
-        timeout=5,
-    )
-    res.raise_for_status()
-    res.encoding = "euc-kr"
-    soup = BeautifulSoup(res.text, "html.parser")
 
-    def clean(s):
-        return s.replace(",", "").replace("+", "").strip() if s else ""
+    # ── 1. KIS inquire-price (PER, PBR, 시가총액, 52주 고저, 외국인 소진율) ──
+    if KIS_APP_KEY and KIS_APP_SECRET:
+        try:
+            token = _get_kis_token()
+            r = requests.get(
+                f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price",
+                params={"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code},
+                headers={"authorization": f"Bearer {token}", "appkey": KIS_APP_KEY,
+                         "appsecret": KIS_APP_SECRET, "tr_id": "FHKST01010100", "custtype": "P"},
+                timeout=8,
+            )
+            if r.ok:
+                o = r.json().get("output") or {}
+                def _f(k):
+                    try: return float(o[k]) or None
+                    except: return None
+                def _i(k):
+                    try: return int(o[k]) or None
+                    except: return None
+                result["per"]           = _f("per")
+                result["pbr"]           = _f("pbr")
+                result["high52"]        = _i("w52_hgpr")
+                result["low52"]         = _i("w52_lwpr")
+                result["foreign_ratio"] = _f("hts_frgn_ehrt")
+                avls = _f("hts_avls")  # 억원 단위
+                if avls: result["marcap"] = round(avls)
+        except Exception:
+            pass
 
-    result = {"per": None, "pbr": None, "marcap": None, "div": None}
-
-    # PER
-    per_th = soup.find("th", string="PER")
-    if per_th:
-        td = per_th.find_next_sibling("td")
-        if td:
-            try:
-                result["per"] = float(clean((td.find("em") or td).get_text(strip=True)))
-            except Exception:
-                pass
-
-    # PBR
-    for th in soup.find_all("th"):
-        if th.get_text(strip=True).startswith("PBR"):
-            td = th.find_next_sibling("td")
-            if td:
-                try:
-                    result["pbr"] = float(clean((td.find("em") or td).get_text(strip=True)))
-                except Exception:
-                    pass
-            break
-
-    # 시가총액 (억 단위)
-    for th in soup.find_all("th"):
-        if "시가총액" in th.get_text():
-            td = th.find_next_sibling("td")
-            if td:
-                m = re.search(r"([\d,]+)억", td.get_text(strip=True))
-                if m:
-                    result["marcap"] = int(m.group(1).replace(",", ""))
-                    break
-
-    # 배당수익률
-    for th in soup.find_all("th"):
-        if "배당수익률" in th.get_text():
-            td = th.find_next_sibling("td")
-            if td:
-                m = re.search(r"([\d.]+)%", td.get_text(strip=True))
-                if m:
-                    result["div"] = float(m.group(1))
-            break
+    # ── 2. Naver fallback (배당수익률, KIS 실패 시 나머지 필드) ────────
+    naver_needed = result["per"] is None or result["div"] is None
+    if naver_needed:
+        try:
+            pc_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                          "Referer": "https://finance.naver.com/"}
+            r2 = requests.get(f"https://finance.naver.com/item/sise.naver?code={code}",
+                              headers=pc_headers, timeout=5)
+            r2.encoding = "euc-kr"
+            soup = BeautifulSoup(r2.text, "html.parser")
+            for th in soup.find_all("th"):
+                t = th.get_text(strip=True)
+                td = th.find_next_sibling("td")
+                if not td: continue
+                td_text = td.get_text(strip=True)
+                if "배당수익률" in t:
+                    m = re.search(r"([\d.]+)%", td_text)
+                    if m: result["div"] = float(m.group(1))
+                elif result["per"] is None and "PER" in t:
+                    try: result["per"] = float(re.sub(r"[^\d.]", "", td_text)) or None
+                    except: pass
+                elif result["high52"] is None and ("52주 최고" in t or t == "52주최고"):
+                    m = re.search(r"([\d,]+)", td_text)
+                    if m: result["high52"] = int(m.group(1).replace(",", ""))
+                elif result["low52"] is None and ("52주 최저" in t or t == "52주최저"):
+                    m = re.search(r"([\d,]+)", td_text)
+                    if m: result["low52"] = int(m.group(1).replace(",", ""))
+                elif result["foreign_ratio"] is None and "소진율" in t:
+                    m = re.search(r"([\d.]+)%", td_text)
+                    if m: result["foreign_ratio"] = float(m.group(1))
+        except Exception:
+            pass
 
     return result
 
@@ -311,10 +333,103 @@ async def get_financials(code: str):
             return data
     loop = asyncio.get_event_loop()
     try:
-        data = await loop.run_in_executor(None, lambda: _fetch_naver_fundamentals(code))
+        data = await loop.run_in_executor(None, lambda: _fetch_fundamentals(code))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"재무 지표 조회 실패: {e}")
     _fundamentals_cache[code] = (time.time(), data)
+    return data
+
+
+def _get_kis_token() -> str:
+    """KIS OAuth 토큰 반환. 파일 캐시로 서버 재시작 시에도 재활용 (분당 1회 발급 제한 우회)."""
+    # 1) 메모리 캐시 유효
+    if time.time() < _kis_token["expires_at"] - 300 and _kis_token["token"]:
+        return _kis_token["token"]
+    # 2) 파일 캐시 복원
+    if os.path.exists(_KIS_TOKEN_FILE):
+        try:
+            with open(_KIS_TOKEN_FILE) as f:
+                saved = json.load(f)
+            if time.time() < saved.get("expires_at", 0) - 300:
+                _kis_token["token"] = saved["token"]
+                _kis_token["expires_at"] = saved["expires_at"]
+                return _kis_token["token"]
+        except Exception:
+            pass
+    # 3) 새 토큰 발급
+    r = requests.post(
+        f"{KIS_BASE_URL}/oauth2/tokenP",
+        json={"grant_type": "client_credentials", "appkey": KIS_APP_KEY, "appsecret": KIS_APP_SECRET},
+        headers={"content-type": "application/json"},
+        timeout=10,
+    )
+    r.raise_for_status()
+    j = r.json()
+    if "access_token" not in j:
+        raise RuntimeError(f"KIS 토큰 발급 실패: {j}")
+    _kis_token["token"] = j["access_token"]
+    _kis_token["expires_at"] = time.time() + j.get("expires_in", 86400)
+    try:
+        with open(_KIS_TOKEN_FILE, "w") as f:
+            json.dump({"token": _kis_token["token"], "expires_at": _kis_token["expires_at"]}, f)
+    except Exception:
+        pass
+    return _kis_token["token"]
+
+
+def _fetch_kis_investor(code: str) -> dict:
+    token = _get_kis_token()
+    r = requests.get(
+        f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-investor",
+        params={"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code},
+        headers={
+            "content-type": "application/json",
+            "authorization": f"Bearer {token}",
+            "appkey": KIS_APP_KEY,
+            "appsecret": KIS_APP_SECRET,
+            "tr_id": "FHKST01010900",
+            "custtype": "P",
+        },
+        timeout=10,
+    )
+    j = r.json() if r.ok else {}
+    if j.get("rt_cd") not in (None, "0"):
+        return {}
+    rows = j.get("output") or j.get("output1") or []
+    if not rows:
+        return {}
+    # output[0] = 당일(또는 최근 영업일)
+    today = rows[0]
+    def to_bil(s):
+        # KIS tr_pbmn 단위: 백만원 → 억원 변환
+        try: return round(int(s) / 100, 1)
+        except: return None
+    return {
+        "date": today.get("stck_bsop_date", ""),
+        "개인":  {"net": to_bil(today.get("prsn_ntby_tr_pbmn", "0"))},
+        "기관":  {"net": to_bil(today.get("orgn_ntby_tr_pbmn", "0"))},
+        "외국인":{"net": to_bil(today.get("frgn_ntby_tr_pbmn", "0"))},
+    }
+
+
+
+
+
+@app.get("/api/investor/{code}")
+async def get_investor(code: str):
+    if not KIS_APP_KEY or not KIS_APP_SECRET:
+        raise HTTPException(status_code=503, detail="KIS API 키 미설정")
+    if code in _investor_cache:
+        ts, data = _investor_cache[code]
+        if time.time() - ts < INVESTOR_CACHE_TTL:
+            return data
+    loop = asyncio.get_event_loop()
+    try:
+        data = await loop.run_in_executor(None, lambda: _fetch_kis_investor(code))
+    except Exception as e:
+        print(f"[investor] {code} 조회 실패: {e}")
+        return {}  # UI에서 섹션 숨김 처리
+    _investor_cache[code] = (time.time(), data)
     return data
 
 
