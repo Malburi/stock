@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 import asyncio
 import time
 import pandas as pd
+import requests
 
 _stock_db: list[dict] = []
 
@@ -55,6 +56,59 @@ CACHE_TTL = 1800
 
 # 기간 → 조회할 캘린더일 수 (거래일 여유분 포함)
 PERIOD_CAL_DAYS = {"1M": 45, "3M": 110, "6M": 210, "1Y": 400}
+
+_current_cache: dict = {}
+CURRENT_CACHE_TTL = 30  # 30초
+
+NAVER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15"
+}
+
+def _fetch_naver_current(code: str) -> dict:
+    res = requests.get(
+        f"https://m.stock.naver.com/api/stock/{code}/basic",
+        headers=NAVER_HEADERS,
+        timeout=5,
+    )
+    res.raise_for_status()
+    j = res.json()
+
+    def clean(s):
+        return str(s).replace(",", "").replace("+", "").strip()
+
+    close = j.get("closePrice") or j.get("stockPrice") or "0"
+    change = j.get("compareToPreviousClosePrice", "0")
+    change_pct = j.get("fluctuationsRatio", "0")
+    # 부호 처리: 네이버는 상승 시 양수, 하락 시 음수로 반환
+    try:
+        change_int = int(clean(change))
+    except:
+        change_int = 0
+    try:
+        change_f = float(clean(change_pct))
+    except:
+        change_f = 0.0
+
+    return {
+        "close": int(clean(close)),
+        "change": change_int,
+        "changePct": change_f,
+    }
+
+
+@app.get("/api/current/{code}")
+async def get_current_price(code: str):
+    if code in _current_cache:
+        ts, data = _current_cache[code]
+        if time.time() - ts < CURRENT_CACHE_TTL:
+            return data
+    loop = asyncio.get_event_loop()
+    try:
+        data = await loop.run_in_executor(None, lambda: _fetch_naver_current(code))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"현재가 조회 실패: {e}")
+    _current_cache[code] = (time.time(), data)
+    return data
 
 
 @app.get("/api/stocks/search")

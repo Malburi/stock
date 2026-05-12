@@ -157,7 +157,9 @@ function StockTracker() {
   const [fetchedAt,    setFetchedAt]    = useState(null);
   const [priceLoading, setPriceLoading] = useState(false);
   const [priceError,   setPriceError]   = useState('');
+  const [currentPrices, setCurrentPrices] = useState({});  // {code: {close, change, changePct, loading}}
   const searchRef = useRef(null);
+  const refreshTimer = useRef(null);
 
   // 초기 로드
   useEffect(() => {
@@ -165,6 +167,35 @@ function StockTracker() {
     if (Array.isArray(saved)) setWatchlist(saved);
     setReady(true);
   }, []);
+
+  // 현재가 일괄 조회
+  const loadCurrentPrices = useCallback(async (list) => {
+    if (!list.length) return;
+    // 로딩 상태 세팅
+    setCurrentPrices(prev => {
+      const next = { ...prev };
+      list.forEach(s => { next[s.c] = { ...next[s.c], loading: true }; });
+      return next;
+    });
+    await Promise.all(list.map(async s => {
+      try {
+        const res = await fetch(`/api/current/${s.c}`);
+        if (!res.ok) throw new Error();
+        const data = await res.json();
+        setCurrentPrices(prev => ({ ...prev, [s.c]: { ...data, loading: false } }));
+      } catch {
+        setCurrentPrices(prev => ({ ...prev, [s.c]: { ...prev[s.c], loading: false } }));
+      }
+    }));
+  }, []);
+
+  // 리스트 화면일 때 현재가 조회 + 60초마다 자동 갱신
+  useEffect(() => {
+    if (screen !== 'list' || !watchlist.length) return;
+    loadCurrentPrices(watchlist);
+    refreshTimer.current = setInterval(() => loadCurrentPrices(watchlist), 60000);
+    return () => clearInterval(refreshTimer.current);
+  }, [screen, watchlist]);
 
   // 검색 화면 진입 시 초기화 + 포커스
   useEffect(() => {
@@ -433,22 +464,40 @@ function StockTracker() {
               <>
                 <div className="mono text-[11px] text-stone-400 mb-3">{watchlist.length}개 종목 등록됨</div>
                 <ul className="space-y-2">
-                  {watchlist.map(s => (
-                    <li key={s.c}>
-                      <div className="flex items-stretch bg-white border-2 border-stone-200 active:border-stone-900 transition-colors">
-                        <button className="flex-1 text-left px-4 py-4 min-w-0" onClick={() => openDetail(s)}>
-                          <div className="font-bold text-base truncate">{s.n}</div>
-                          <div className="mono text-xs text-stone-500 mt-0.5">{s.c} · {s.m}</div>
-                        </button>
-                        <button onClick={() => removeStock(s.c)}
-                                className="px-4 border-l border-stone-100 text-stone-300 active:text-red-600 active:bg-red-50">
-                          <Trash2 size={16}/>
-                        </button>
-                      </div>
-                    </li>
-                  ))}
+                  {watchlist.map(s => {
+                    const cp = currentPrices[s.c];
+                    return (
+                      <li key={s.c}>
+                        <div className="flex items-stretch bg-white border-2 border-stone-200 active:border-stone-900 transition-colors">
+                          <button className="flex-1 text-left px-4 py-4 min-w-0" onClick={() => openDetail(s)}>
+                            <div className="flex items-center justify-between gap-2">
+                              <div className="font-bold text-base truncate">{s.n}</div>
+                              {cp?.loading
+                                ? <Loader2 size={14} className="animate-spin text-stone-300 shrink-0"/>
+                                : cp?.close
+                                  ? <div className="text-right shrink-0">
+                                      <div className={`mono font-black text-base ${cc(cp.change)}`}>
+                                        ₩{fp(cp.close)}
+                                      </div>
+                                      <div className={`mono text-xs ${cc(cp.change)}`}>
+                                        {cp.change > 0 ? '+' : ''}{fp(cp.change)} ({cp.change > 0 ? '+' : ''}{Number(cp.changePct).toFixed(2)}%)
+                                      </div>
+                                    </div>
+                                  : null
+                              }
+                            </div>
+                            <div className="mono text-xs text-stone-500 mt-0.5">{s.c} · {s.m}</div>
+                          </button>
+                          <button onClick={() => removeStock(s.c)}
+                                  className="px-4 border-l border-stone-100 text-stone-300 active:text-red-600 active:bg-red-50">
+                            <Trash2 size={16}/>
+                          </button>
+                        </div>
+                      </li>
+                    );
+                  })}
                 </ul>
-                <div className="mono text-[10px] text-stone-400 text-center mt-6">종목을 탭하면 종가 조회</div>
+                <div className="mono text-[10px] text-stone-400 text-center mt-6">60초마다 자동 갱신 · 탭하면 차트 조회</div>
               </>
             )
         }
