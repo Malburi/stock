@@ -286,6 +286,8 @@ def _fetch_fundamentals(code: str) -> dict:
                 result["foreign_ratio"] = _f("hts_frgn_ehrt")
                 avls = _f("hts_avls")  # 억원 단위
                 if avls: result["marcap"] = round(avls)
+                result["vol"]           = _i("acml_vol")        # 누적 거래량 (주)
+                result["tr_pbmn"]       = _i("acml_tr_pbmn")   # 누적 거래대금 (백만원)
         except Exception:
             pass
 

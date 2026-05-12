@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s -H 'User-Agent: Mozilla/5.0 \\(Windows NT 10.0; Win64; x64\\) AppleWebKit/537.36' -H 'Referer: https://finance.naver.com/' https://m.stock.naver.com/api/stock/005930/basic)",
+      "Bash(python3 -m json.tool)",
+      "Bash(curl -s -w '\\\\nStatus: %{http_code}\\\\n' -H 'User-Agent: Mozilla/5.0 \\(Windows NT 10.0; Win64; x64\\) AppleWebKit/537.36' -H 'Referer: https://finance.naver.com/' https://m.stock.naver.com/api/stock/005930/quote)",
+      "Bash(curl -s -w '\\\\nStatus: %{http_code}\\\\n' -H 'User-Agent: Mozilla/5.0 \\(Windows NT 10.0; Win64; x64\\) AppleWebKit/537.36' -H 'Referer: https://finance.naver.com/' https://m.stock.naver.com/api/stock/005930/trading)",
+      "Bash(curl -s -w '\\\\nStatus: %{http_code}\\\\n' -H 'User-Agent: Mozilla/5.0 \\(Windows NT 10.0; Win64; x64\\) AppleWebKit/537.36' -H 'Referer: https://finance.naver.com/' https://m.stock.naver.com/api/stock/005930/today)",
+      "Bash(curl -s -w 'Status: %{http_code}\\\\n' -H 'User-Agent: Mozilla/5.0 \\(Windows NT 10.0; Win64; x64\\) AppleWebKit/537.36' -H 'Referer: https://finance.naver.com/' https://m.stock.naver.com/api/stock/005930/overview)",
+      "Bash(curl -s -w 'Status: %{http_code}\\\\n' -H 'User-Agent: Mozilla/5.0 \\(Windows NT 10.0; Win64; x64\\) AppleWebKit/537.36' -H 'Referer: https://finance.naver.com/' https://m.stock.naver.com/api/stock/005930/discussion)",
+      "Bash(curl -s -w 'Status: %{http_code}\\\\n' -H 'User-Agent: Mozilla/5.0 \\(Windows NT 10.0; Win64; x64\\) AppleWebKit/537.36' -H 'Referer: https://finance.naver.com/' https://m.stock.naver.com/api/stock/005930/charts/day)"
+    ]
+  }
+}
