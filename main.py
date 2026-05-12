@@ -8,6 +8,8 @@ import asyncio
 import time
 import pandas as pd
 import requests
+import xml.etree.ElementTree as ET
+from urllib.parse import quote
 
 _stock_db: list[dict] = []
 
@@ -60,6 +62,9 @@ PERIOD_CAL_DAYS = {"1M": 45, "3M": 110, "6M": 210, "1Y": 400}
 _current_cache: dict = {}
 CURRENT_CACHE_TTL = 30  # 30초
 
+_news_cache: dict = {}
+NEWS_CACHE_TTL = 600  # 10분
+
 NAVER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15"
 }
@@ -109,6 +114,49 @@ async def get_current_price(code: str):
         raise HTTPException(status_code=500, detail=f"현재가 조회 실패: {e}")
     _current_cache[code] = (time.time(), data)
     return data
+
+
+@app.get("/api/news/{code}")
+async def get_news(code: str, name: str = ""):
+    if code in _news_cache:
+        ts, data = _news_cache[code]
+        if time.time() - ts < NEWS_CACHE_TTL:
+            return data
+
+    # 종목명 결정 (파라미터 우선, 없으면 DB 조회)
+    stock_name = name or next((s["n"] for s in _stock_db if s["c"] == code), code)
+    query = quote(f"{stock_name} 주식")
+    url = f"https://news.google.com/rss/search?q={query}&hl=ko&gl=KR&ceid=KR:ko"
+
+    loop = asyncio.get_event_loop()
+    try:
+        res = await loop.run_in_executor(None, lambda: requests.get(
+            url, headers=NAVER_HEADERS, timeout=8
+        ))
+        res.raise_for_status()
+        root = ET.fromstring(res.content)
+        news = []
+        for item in root.findall(".//item")[:6]:
+            source_el = item.find("source")
+            pub = item.findtext("pubDate", "")
+            # "Mon, 11 May 2026 08:17:02 GMT" → "05/11"
+            try:
+                from email.utils import parsedate
+                d = parsedate(pub)
+                date_str = f"{d[1]:02d}/{d[2]:02d}" if d else ""
+            except:
+                date_str = ""
+            news.append({
+                "title": item.findtext("title", "").strip(),
+                "link":  item.findtext("link", "").strip(),
+                "source": source_el.text if source_el is not None else "",
+                "date": date_str,
+            })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    _news_cache[code] = (time.time(), news)
+    return news
 
 
 @app.get("/api/stocks/search")

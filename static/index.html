@@ -157,7 +157,9 @@ function StockTracker() {
   const [fetchedAt,    setFetchedAt]    = useState(null);
   const [priceLoading, setPriceLoading] = useState(false);
   const [priceError,   setPriceError]   = useState('');
-  const [currentPrices, setCurrentPrices] = useState({});  // {code: {close, change, changePct, loading}}
+  const [currentPrices, setCurrentPrices] = useState({});
+  const [news,         setNews]         = useState([]);
+  const [newsLoading,  setNewsLoading]  = useState(false);  // {code: {close, change, changePct, loading}}
   const searchRef = useRef(null);
   const refreshTimer = useRef(null);
 
@@ -252,9 +254,19 @@ function StockTracker() {
     }
   }, []);
 
+  const loadNews = useCallback(async (stock) => {
+    setNewsLoading(true); setNews([]);
+    try {
+      const res = await fetch(`/api/news/${stock.c}?name=${encodeURIComponent(stock.n)}`);
+      if (res.ok) setNews(await res.json());
+    } catch {}
+    setNewsLoading(false);
+  }, []);
+
   const openDetail = stock => {
     setSelected(stock); setPriceData(null); setPriceError('');
-    setPeriod('1M'); setScreen('detail'); loadPrices(stock, '1M');
+    setNews([]); setPeriod('1M'); setScreen('detail');
+    loadPrices(stock, '1M'); loadNews(stock);
   };
 
   const changePeriod = p => { setPeriod(p); loadPrices(selected, p); };
@@ -420,11 +432,33 @@ function StockTracker() {
             </div>
 
             {(priceSource || fetchedAt) && (
-              <div className="text-center mono text-xs text-stone-400 pb-4 leading-relaxed">
+              <div className="text-center mono text-xs text-stone-400 leading-relaxed">
                 {priceSource && <div>출처: {priceSource}</div>}
                 {fetchedAt && <div>조회: {new Date(fetchedAt).toLocaleTimeString('ko-KR')} · 30분 캐시</div>}
               </div>
             )}
+
+            {/* 관련 뉴스 */}
+            <div className="border-2 border-stone-900">
+              <div className="border-b-2 border-stone-900 px-4 py-3 flex justify-between items-center">
+                <div className="text-xs font-bold tracking-widest">관련 뉴스</div>
+                {newsLoading && <Loader2 size={14} className="animate-spin text-stone-400"/>}
+              </div>
+              {!newsLoading && news.length === 0 && (
+                <div className="px-4 py-6 text-center text-xs text-stone-400">뉴스를 불러올 수 없습니다</div>
+              )}
+              <ul>
+                {news.map((n, i) => (
+                  <li key={i} className={i !== news.length - 1 ? 'border-b border-stone-100' : ''}>
+                    <a href={n.link} target="_blank" rel="noopener noreferrer"
+                       className="block px-4 py-3 active:bg-stone-50">
+                      <div className="text-sm font-medium leading-snug text-stone-800 line-clamp-2">{n.title}</div>
+                      <div className="mono text-xs text-stone-400 mt-1">{n.source} · {n.date}</div>
+                    </a>
+                  </li>
+                ))}
+              </ul>
+            </div>
           </>
         )}
       </div>
