@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 import FinanceDataReader as fdr
@@ -180,13 +181,18 @@ _current_cache: dict = {}
 CURRENT_CACHE_TTL = 30  # 30초
 
 _news_cache: dict = {}
-NEWS_CACHE_TTL = 600  # 10분
+NEWS_CACHE_TTL = 120  # 2분
 
 _fundamentals_cache: dict = {}
 FUNDAMENTALS_CACHE_TTL = 600  # 10분
 
 _index_cache: dict = {}
 INDEX_CACHE_TTL = 300  # 5분
+
+_ai_cache: dict = {}
+AI_CACHE_TTL = 3600  # 1시간
+
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 _investor_cache: dict = {}
 INVESTOR_CACHE_TTL = 300  # 5분
@@ -524,6 +530,184 @@ async def push_unsubscribe(request: Request):
     return {"ok": True}
 
 
+def _build_gemini_prompt(stock_name: str, code: str, current: dict, fund: dict, investor: dict, news: list) -> str:
+    lines = [f"종목: {stock_name} ({code})\n"]
+
+    if current:
+        lines.append(f"현재가: {current.get('close', '-'):,}원  등락: {current.get('change', 0):+,}원 ({current.get('changePct', 0):+.2f}%)")
+
+    if fund:
+        per  = f"{fund['per']:.2f}배"  if fund.get('per')  else '-'
+        pbr  = f"{fund['pbr']:.2f}배"  if fund.get('pbr')  else '-'
+        div  = f"{fund['div']:.2f}%"   if fund.get('div')  else '-'
+        h52  = f"{fund['high52']:,}원"  if fund.get('high52') else '-'
+        l52  = f"{fund['low52']:,}원"   if fund.get('low52')  else '-'
+        fr   = f"{fund['foreign_ratio']:.2f}%" if fund.get('foreign_ratio') else '-'
+        marc = f"{fund['marcap']:,}억원" if fund.get('marcap') else '-'
+        lines.append(f"PER: {per}  PBR: {pbr}  배당률: {div}")
+        lines.append(f"시가총액: {marc}  52주 최고: {h52}  52주 최저: {l52}  외국인 비중: {fr}")
+
+    if investor and investor.get('개인'):
+        rows = []
+        for who in ['개인', '기관', '외국인']:
+            net = investor.get(who, {}).get('net')
+            if net is not None:
+                rows.append(f"{who} {net:+.0f}억")
+        lines.append("당일 수급: " + "  ".join(rows))
+
+    if news:
+        headlines = "  /  ".join(n['title'] for n in news[:4])
+        lines.append(f"최신 뉴스: {headlines}")
+
+    lines.append("""
+위 데이터를 바탕으로 단기(1~4주) 관점의 매매 의견을 아래 JSON 형식으로만 답하세요. 다른 텍스트는 절대 출력하지 마세요.
+
+{
+  "verdict": "매수관심 또는 중립 또는 매도고려",
+  "summary": "핵심 한 줄 요약 (30자 이내)",
+  "reasons": ["근거1", "근거2", "근거3"],
+  "risk": "주요 리스크 한 줄"
+}""")
+    return "\n".join(lines)
+
+
+@app.get("/api/ai/opinion/{code}")
+async def get_ai_opinion(code: str, force: bool = False):
+    api_key = os.environ.get("GEMINI_API_KEY") or GEMINI_API_KEY
+    if not api_key:
+        raise HTTPException(status_code=503, detail="GEMINI_API_KEY 미설정")
+
+    if not force and code in _ai_cache:
+        ts, data = _ai_cache[code]
+        if time.time() - ts < AI_CACHE_TTL:
+            return data
+
+    loop = asyncio.get_event_loop()
+    stock_name = next((s["n"] for s in _stock_db if s["c"] == code), code)
+
+    current, fund = await asyncio.gather(
+        loop.run_in_executor(None, lambda: _fetch_naver_current(code)),
+        loop.run_in_executor(None, lambda: _fetch_fundamentals(code)),
+        return_exceptions=True,
+    )
+    if isinstance(current, Exception): current = {}
+    if isinstance(fund, Exception):    fund = {}
+
+    # 뉴스·수급은 캐시 우선
+    news_data = _news_cache.get(code, (0, []))[1]
+    inv_data  = _investor_cache.get(code, (0, {}))[1]
+
+    prompt = _build_gemini_prompt(stock_name, code, current, fund, inv_data, news_data)
+
+    try:
+        from google import genai
+        client = genai.Client(api_key=api_key)
+        MODELS = ["models/gemini-2.5-flash", "models/gemini-2.0-flash", "models/gemini-flash-latest"]
+        last_err = None
+        resp = None
+        for model in MODELS:
+            for attempt in range(3):
+                try:
+                    resp = await loop.run_in_executor(
+                        None, lambda m=model: client.models.generate_content(model=m, contents=prompt)
+                    )
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = e
+                    msg = str(e)
+                    if "503" in msg or "429" in msg:
+                        await asyncio.sleep(2 ** attempt)
+                        continue
+                    break
+            if resp:
+                break
+        if not resp:
+            raise last_err
+        raw  = resp.text.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+        data = json.loads(raw)
+    except Exception as e:
+        print(f"[AI] Gemini 오류: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=f"Gemini 호출 실패: {type(e).__name__}: {e}")
+
+    result = {**data, "generatedAt": time.time(), "stockName": stock_name}
+    _ai_cache[code] = (time.time(), result)
+    return result
+
+
+@app.get("/api/stream/prices")
+async def stream_prices(codes: str = ""):
+    """SSE: 5초마다 관심종목 현재가 일괄 푸시."""
+    code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
+
+    async def generate():
+        loop = asyncio.get_event_loop()
+        while True:
+            if code_list:
+                tasks = [
+                    loop.run_in_executor(None, lambda c=code: _fetch_naver_current(c))
+                    for code in code_list
+                ]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                prices = {
+                    code: result
+                    for code, result in zip(code_list, results)
+                    if not isinstance(result, Exception)
+                }
+                if prices:
+                    yield f"data: {json.dumps(prices)}\n\n"
+            else:
+                yield ": keepalive\n\n"
+            await asyncio.sleep(5)
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
+
+
+def _dedupe_news(items: list, time_window_min: int = 90, text_threshold: float = 0.12) -> list:
+    """시간 근접(90분) + 2-gram 유사도로 같은 사건 중복 기사 제거."""
+    import re as _re
+    from datetime import datetime
+
+    def parse_dt(s: str):
+        for fmt in ("%Y.%m.%d %H:%M", "%Y.%m.%d"):
+            try:
+                return datetime.strptime(s, fmt)
+            except Exception:
+                pass
+        return None
+
+    def bigrams(text: str) -> set:
+        t = _re.sub(r"[^\w]", "", text)
+        return {t[i:i+2] for i in range(len(t) - 1)}
+
+    def sim(t1: str, t2: str) -> float:
+        g1, g2 = bigrams(t1), bigrams(t2)
+        if not g1 or not g2:
+            return 0.0
+        return len(g1 & g2) / len(g1 | g2)
+
+    kept = []
+    for item in items:
+        dt = parse_dt(item.get("date", ""))
+        dup = False
+        for k in kept:
+            s = sim(item["title"], k["title"])
+            if s >= 0.35:          # 텍스트만으로 명백한 중복
+                dup = True; break
+            k_dt = parse_dt(k.get("date", ""))
+            if dt and k_dt:
+                diff = abs((dt - k_dt).total_seconds() / 60)
+                if diff <= time_window_min and s >= text_threshold:
+                    dup = True; break   # 같은 시간대 + 약한 유사도 → 동일 사건
+        if not dup:
+            kept.append(item)
+    return kept
+
+
 @app.get("/api/news/{code}")
 async def get_news(code: str, name: str = ""):
     if code in _news_cache:
@@ -531,38 +715,69 @@ async def get_news(code: str, name: str = ""):
         if time.time() - ts < NEWS_CACHE_TTL:
             return data
 
-    # 종목명 결정 (파라미터 우선, 없으면 DB 조회)
-    stock_name = name or next((s["n"] for s in _stock_db if s["c"] == code), code)
-    query = quote(f"{stock_name} 주식")
-    url = f"https://news.google.com/rss/search?q={query}&hl=ko&gl=KR&ceid=KR:ko"
-
+    from bs4 import BeautifulSoup
     loop = asyncio.get_event_loop()
+    news = []
+    pc_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://finance.naver.com/",
+    }
+
+    # ── 1. 네이버 금융 종목 뉴스 (1차) ───────────────────────────
     try:
         res = await loop.run_in_executor(None, lambda: requests.get(
-            url, headers=NAVER_HEADERS, timeout=8
+            f"https://finance.naver.com/item/news_news.naver?code={code}&page=1",
+            headers=pc_headers, timeout=6,
         ))
-        res.raise_for_status()
-        root = ET.fromstring(res.content)
-        news = []
-        for item in root.findall(".//item")[:6]:
-            source_el = item.find("source")
-            pub = item.findtext("pubDate", "")
-            # "Mon, 11 May 2026 08:17:02 GMT" → "05/11"
-            try:
-                from email.utils import parsedate
-                d = parsedate(pub)
-                date_str = f"{d[1]:02d}/{d[2]:02d}" if d else ""
-            except:
-                date_str = ""
+        res.encoding = "euc-kr"
+        soup = BeautifulSoup(res.text, "html.parser")
+        for row in soup.select("table.type5 tr"):
+            a    = row.select_one("td.title a")
+            date = row.select_one("td.date")
+            press= row.select_one("td.info")
+            if not a:
+                continue
+            href = a.get("href", "")
+            full_link = f"https://finance.naver.com{href}" if href.startswith("/") else href
             news.append({
-                "title": item.findtext("title", "").strip(),
-                "link":  item.findtext("link", "").strip(),
-                "source": source_el.text if source_el is not None else "",
-                "date": date_str,
+                "title":  a.get_text(strip=True),
+                "link":   full_link,
+                "source": press.get_text(strip=True) if press else "",
+                "date":   date.get_text(strip=True) if date else "",
             })
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+            if len(news) >= 20:
+                break
+    except Exception:
+        pass
 
+    # ── 2. Google News RSS fallback ───────────────────────────────
+    if not news:
+        try:
+            stock_name = name or next((s["n"] for s in _stock_db if s["c"] == code), code)
+            query = quote(f"{stock_name} 주식")
+            url   = f"https://news.google.com/rss/search?q={query}&hl=ko&gl=KR&ceid=KR:ko&tbs=qdr:d"
+            res   = await loop.run_in_executor(None, lambda: requests.get(url, headers=NAVER_HEADERS, timeout=8))
+            res.raise_for_status()
+            root  = ET.fromstring(res.content)
+            from email.utils import parsedate
+            for item in root.findall(".//item")[:8]:
+                source_el = item.find("source")
+                pub = item.findtext("pubDate", "")
+                try:
+                    d = parsedate(pub)
+                    date_str = f"{d[1]:02d}/{d[2]:02d}" if d else ""
+                except:
+                    date_str = ""
+                news.append({
+                    "title":  item.findtext("title", "").strip(),
+                    "link":   item.findtext("link",  "").strip(),
+                    "source": source_el.text if source_el is not None else "",
+                    "date":   date_str,
+                })
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    news = _dedupe_news(news)[:6]
     _news_cache[code] = (time.time(), news)
     return news
 

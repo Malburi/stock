@@ -5,3 +5,4 @@ pandas
 beautifulsoup4
 pywebpush
 python-dotenv
+google-genai

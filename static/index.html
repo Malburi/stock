@@ -16,6 +16,16 @@
   <style>
     body { margin:0; -webkit-tap-highlight-color:transparent; }
     .mono { font-family: ui-monospace, 'JetBrains Mono', monospace; }
+    @keyframes flash-up   { 0% { background:#fff0f0; } 100% { background:transparent; } }
+    @keyframes flash-down { 0% { background:#eff6ff; } 100% { background:transparent; } }
+    @keyframes blink { 0%,100% { opacity:1; } 50% { opacity:0.25; } }
+    .flash-up   { animation: flash-up   1.2s ease-out; }
+    .flash-down { animation: flash-down 1.2s ease-out; }
+    .live-dot { display:inline-block; width:6px; height:6px; border-radius:50%; background:#22c55e; animation: blink 1.4s infinite; }
+    @keyframes ai-pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(139,92,246,0.5), 0 4px 20px rgba(139,92,246,0.4); } 50% { box-shadow: 0 0 0 8px rgba(139,92,246,0), 0 4px 20px rgba(139,92,246,0.4); } }
+    @keyframes ai-pulse-result { 0%,100% { box-shadow: 0 0 0 0 rgba(0,0,0,0.15), 0 4px 20px rgba(0,0,0,0.2); } }
+    .ai-fab { animation: ai-pulse 2s infinite; }
+    .ai-fab-done { animation: none; }
   </style>
 </head>
 <body>
@@ -244,14 +254,18 @@ function StockTracker() {
   const [marketIndex,  setMarketIndex]  = useState(null);
   const [fundamentals, setFundamentals] = useState(null);
   const [investor,     setInvestor]     = useState(null);
+  const [aiOpinion,    setAiOpinion]    = useState(null);
+  const [aiLoading,    setAiLoading]    = useState(false);
+  const [aiSheetOpen,  setAiSheetOpen]  = useState(false);
   const [alerts,       setAlerts]       = useState(() => ls.get(ALERTS_KEY) || {});
   const [alertModal,   setAlertModal]   = useState({ open: false, stock: null });
   const [alertDraft,   setAlertDraft]   = useState({ target: '', stopLoss: '', bigMove: false });
   const [pushStatus,   setPushStatus]   = useState('idle'); // idle|requesting|ok|error
-  const searchRef = useRef(null);
-  const refreshTimer = useRef(null);
+  const [liveUpdatedAt, setLiveUpdatedAt] = useState(null);
+  const searchRef  = useRef(null);
   const indexTimer = useRef(null);
-  const swRegRef = useRef(null);
+  const swRegRef   = useRef(null);
+  const esRef      = useRef(null);
 
   // 초기 로드
   useEffect(() => {
@@ -260,26 +274,60 @@ function StockTracker() {
     setReady(true);
   }, []);
 
-  // 현재가 일괄 조회
-  const loadCurrentPrices = useCallback(async (list) => {
-    if (!list.length) return;
-    // 로딩 상태 세팅
+  // SSE 연결 — watchlist가 바뀔 때마다 재연결
+  useEffect(() => {
+    if (!watchlist.length) { esRef.current?.close(); return; }
+
+    // 로딩 상태 초기화
     setCurrentPrices(prev => {
       const next = { ...prev };
-      list.forEach(s => { next[s.c] = { ...next[s.c], loading: true }; });
+      watchlist.forEach(s => { if (!next[s.c]) next[s.c] = { loading: true }; });
       return next;
     });
-    await Promise.all(list.map(async s => {
-      try {
-        const res = await fetch(`/api/current/${s.c}`);
-        if (!res.ok) throw new Error();
-        const data = await res.json();
-        setCurrentPrices(prev => ({ ...prev, [s.c]: { ...data, loading: false } }));
-      } catch {
-        setCurrentPrices(prev => ({ ...prev, [s.c]: { ...prev[s.c], loading: false } }));
-      }
-    }));
-  }, []);
+
+    const codes = watchlist.map(s => s.c).join(',');
+    const connect = () => {
+      esRef.current?.close();
+      const es = new EventSource(`/api/stream/prices?codes=${codes}`);
+      esRef.current = es;
+
+      es.onmessage = (e) => {
+        const data = JSON.parse(e.data);
+        setCurrentPrices(prev => {
+          const next = { ...prev };
+          for (const [code, price] of Object.entries(data)) {
+            const old = prev[code];
+            const changed = old?.close != null && price.close !== old.close;
+            next[code] = {
+              ...price,
+              loading: false,
+              flash: changed ? (price.close > old.close ? 'up' : 'down') : old?.flash ?? null,
+            };
+          }
+          return next;
+        });
+        setLiveUpdatedAt(Date.now());
+        // 1.3초 후 flash 리셋
+        setTimeout(() => {
+          setCurrentPrices(prev => {
+            const next = { ...prev };
+            for (const code of Object.keys(data)) {
+              if (next[code]) next[code] = { ...next[code], flash: null };
+            }
+            return next;
+          });
+        }, 1300);
+      };
+
+      es.onerror = () => {
+        es.close();
+        setTimeout(connect, 5000); // 끊기면 5초 후 재연결
+      };
+    };
+
+    connect();
+    return () => { esRef.current?.close(); };
+  }, [watchlist]);
 
   // ── Push 구독 등록 ──────────────────────────────────────────────
   const registerPush = useCallback(async (currentAlerts) => {
@@ -332,13 +380,6 @@ function StockTracker() {
     return () => clearInterval(indexTimer.current);
   }, []);
 
-  // 리스트 화면일 때 현재가 조회 + 60초마다 자동 갱신
-  useEffect(() => {
-    if (screen !== 'list' || !watchlist.length) return;
-    loadCurrentPrices(watchlist);
-    refreshTimer.current = setInterval(() => loadCurrentPrices(watchlist), 60000);
-    return () => clearInterval(refreshTimer.current);
-  }, [screen, watchlist]);
 
   // 검색 화면 진입 시 초기화 + 포커스
   useEffect(() => {
@@ -412,6 +453,15 @@ function StockTracker() {
     } catch {}
   }, []);
 
+  const loadAiOpinion = useCallback(async (stock, force = false) => {
+    setAiLoading(true); setAiOpinion(null);
+    try {
+      const res = await fetch(`/api/ai/opinion/${stock.c}${force ? '?force=true' : ''}`);
+      if (res.ok) setAiOpinion(await res.json());
+    } catch {}
+    setAiLoading(false);
+  }, []);
+
   const loadInvestor = useCallback(async (stock) => {
     setInvestor(null);
     try {
@@ -460,14 +510,18 @@ function StockTracker() {
 
   const openDetail = stock => {
     setSelected(stock); setPriceData(null); setPriceError('');
-    setNews([]); setFundamentals(null); setInvestor(null); setPeriod('1M'); setScreen('detail');
-    loadPrices(stock, '1M'); loadNews(stock); loadFundamentals(stock); loadInvestor(stock);
+    setNews([]); setFundamentals(null); setInvestor(null); setAiOpinion(null); setAiSheetOpen(false); setPeriod('1M'); setScreen('detail');
+    loadPrices(stock, '1M'); loadNews(stock); loadFundamentals(stock); loadInvestor(stock); loadAiOpinion(stock);
   };
 
   const changePeriod = p => { setPeriod(p); loadPrices(selected, p); };
 
   const latest    = priceData?.[0];
   const chartData = priceData ? [...priceData].reverse() : [];
+  const livePrice = selected ? currentPrices[selected.c] : null;
+  const dispClose    = livePrice?.close    ?? latest?.close;
+  const dispChange   = livePrice?.change   ?? latest?.change;
+  const dispChangePct= livePrice?.changePct?? latest?.changePct;
   const BASE = { fontFamily: 'system-ui, -apple-system, sans-serif' };
 
   // ── 검색 화면 ──────────────────────────────────────────────────
@@ -629,12 +683,12 @@ function StockTracker() {
                 <div className="text-[10px] tracking-widest text-stone-400 mb-2">당일 거래</div>
                 <div className="flex flex-col gap-1.5">
                   <div className="flex justify-between items-baseline">
-                    <span className="text-[10px] text-stone-400">거래량</span>
-                    <span className="mono text-sm font-bold text-stone-800">{fundamentals.vol ? fp(fundamentals.vol)+'주' : '-'}</span>
+                    <span className="text-[10px] text-stone-400">거래량 <span className="text-stone-300">(주)</span></span>
+                    <span className="mono text-sm font-bold text-stone-800">{fundamentals.vol ? fp(fundamentals.vol) : '-'}</span>
                   </div>
                   <div className="flex justify-between items-baseline">
-                    <span className="text-[10px] text-stone-400">거래대금</span>
-                    <span className="mono text-sm font-bold text-stone-800">{fundamentals.tr_pbmn ? fp(fundamentals.tr_pbmn)+'원' : '-'}</span>
+                    <span className="text-[10px] text-stone-400">거래대금 <span className="text-stone-300">(백만원)</span></span>
+                    <span className="mono text-sm font-bold text-stone-800">{fundamentals.tr_pbmn ? fp(Math.round(fundamentals.tr_pbmn / 1000000)) : '-'}</span>
                   </div>
                 </div>
               </div>
@@ -685,16 +739,21 @@ function StockTracker() {
           );
         })()}
 
-        {latest && !priceLoading && (
+        {!priceLoading && dispClose && (
           <>
-            <div className="bg-stone-900 text-white p-5">
-              <div className="text-xs text-stone-400 tracking-widest mb-2">LATEST CLOSE</div>
-              <div className="mono text-4xl font-black mb-2">₩{fp(latest.close)}</div>
-              <div className={`mono text-sm font-bold flex items-center gap-1 ${cc(latest.change)}`}>
-                {latest.change > 0 ? <TrendingUp size={14}/> : latest.change < 0 ? <TrendingDown size={14}/> : null}
-                {fChange(latest.change, latest.changePct)}
+            <div className={`bg-stone-900 text-white p-5 ${livePrice?.flash === 'up' ? 'flash-up' : livePrice?.flash === 'down' ? 'flash-down' : ''}`}
+                 style={{ borderRadius:0 }}>
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-xs text-stone-400 tracking-widest">현재가</span>
+                <span className="live-dot"></span>
+                <span className="text-[10px] text-green-400 font-bold tracking-wide">LIVE</span>
               </div>
-              <div className="mono text-xs text-stone-500 mt-3">{latest.date}</div>
+              <div className="mono text-4xl font-black mb-2">₩{fp(dispClose)}</div>
+              <div className={`mono text-sm font-bold flex items-center gap-1 ${cc(dispChange)}`}>
+                {dispChange > 0 ? <TrendingUp size={14}/> : dispChange < 0 ? <TrendingDown size={14}/> : null}
+                {fChange(dispChange, dispChangePct)}
+              </div>
+              {latest && <div className="mono text-xs text-stone-500 mt-3">전일종가 기준 {latest.date}</div>}
             </div>
 
             {chartData.length > 1 && (
@@ -706,7 +765,7 @@ function StockTracker() {
               </div>
             )}
 
-            <div className="border-2 border-stone-900">
+            {priceData && <div className="border-2 border-stone-900">
               <div className="border-b-2 border-stone-900 px-4 py-3 flex justify-between items-center">
                 <div className="text-xs font-bold tracking-widest">일별 종가</div>
                 <div className="mono text-xs text-stone-400">최신순</div>
@@ -722,7 +781,7 @@ function StockTracker() {
                   </li>
                 ))}
               </ul>
-            </div>
+            </div>}
 
             {(priceSource || fetchedAt) && (
               <div className="text-center mono text-xs text-stone-400 leading-relaxed">
@@ -752,9 +811,154 @@ function StockTracker() {
                 ))}
               </ul>
             </div>
+
           </>
         )}
       </div>
+
+      {/* AI 플로팅 버튼 */}
+      {(() => {
+        const VS = {
+          '매수관심': { grad: 'linear-gradient(135deg,#ef4444,#f97316)', glow: 'rgba(239,68,68,0.5)'  },
+          '중립':     { grad: 'linear-gradient(135deg,#6366f1,#8b5cf6)', glow: 'rgba(139,92,246,0.5)' },
+          '매도고려': { grad: 'linear-gradient(135deg,#3b82f6,#06b6d4)', glow: 'rgba(59,130,246,0.5)' },
+        };
+        const vs = aiOpinion ? (VS[aiOpinion.verdict] || VS['중립']) : null;
+        const grad = vs?.grad ?? 'linear-gradient(135deg,#7c3aed,#a855f7)';
+        const glow = vs?.glow ?? 'rgba(139,92,246,0.5)';
+        return (
+          <button
+            onClick={() => setAiSheetOpen(true)}
+            className={aiOpinion ? 'ai-fab-done' : 'ai-fab'}
+            style={{
+              position: 'fixed', bottom: 28, right: 20, zIndex: 40,
+              width: 64, height: 64, borderRadius: 32,
+              background: grad, border: 'none', cursor: 'pointer',
+              display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 2,
+              boxShadow: `0 4px 24px ${glow}, 0 2px 8px rgba(0,0,0,0.2)`,
+              transition: 'background 0.4s, box-shadow 0.4s',
+            }}
+          >
+            {aiLoading ? (
+              <>
+                <Loader2 size={18} className="animate-spin" style={{ color: '#fff' }}/>
+                <span style={{ color: 'rgba(255,255,255,0.8)', fontSize: 8, fontWeight: 700, letterSpacing: 1 }}>분석중</span>
+              </>
+            ) : (
+              <>
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+                  <path d="M12 2l2.4 7.4H22l-6.2 4.5 2.4 7.4L12 17l-6.2 4.3 2.4-7.4L2 9.4h7.6z" fill="rgba(255,255,255,0.95)"/>
+                </svg>
+                <span style={{ color: '#fff', fontSize: 9, fontWeight: 900, letterSpacing: '0.08em' }}>
+                  {aiOpinion ? aiOpinion.verdict : 'AI 분석'}
+                </span>
+              </>
+            )}
+          </button>
+        );
+      })()}
+
+      {/* AI 바텀시트 */}
+      {aiSheetOpen && (() => {
+        const verdictStyle = {
+          '매수관심': { bg: '#fef2f2', border: '#ef4444', text: '#dc2626', badge: '#dc2626' },
+          '중립':     { bg: '#fafaf9', border: '#d6d3d1', text: '#57534e', badge: '#78716c' },
+          '매도고려': { bg: '#eff6ff', border: '#3b82f6', text: '#2563eb', badge: '#2563eb' },
+        };
+        const vs = aiOpinion ? (verdictStyle[aiOpinion.verdict] || verdictStyle['중립']) : verdictStyle['중립'];
+        return (
+          <div style={{ position: 'fixed', inset: 0, zIndex: 50, display: 'flex', flexDirection: 'column', justifyContent: 'flex-end' }}>
+            <div onClick={() => setAiSheetOpen(false)} style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.45)' }}/>
+            <div style={{ position: 'relative', background: '#fff', borderTop: '3px solid #1c1917', paddingBottom: 'env(safe-area-inset-bottom, 16px)', maxHeight: '80vh', overflowY: 'auto' }}>
+              {/* 핸들 */}
+              <div style={{ display: 'flex', justifyContent: 'center', padding: '10px 0 4px' }}>
+                <div style={{ width: 36, height: 4, borderRadius: 2, background: '#d6d3d1' }}/>
+              </div>
+              {/* 헤더 */}
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '4px 20px 12px', borderBottom: '2px solid #1c1917' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <span style={{ fontWeight: 900, fontSize: 15 }}>AI 매매 의견</span>
+                  <span style={{ fontSize: 10, fontFamily: 'monospace', color: '#a8a29e', background: '#f5f5f4', padding: '2px 6px' }}>Gemini</span>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  {!aiLoading && <button onClick={() => { loadAiOpinion(selected, true); }}
+                    style={{ fontSize: 11, fontFamily: 'monospace', color: '#78716c', background: 'none', border: '1px solid #e7e5e4', cursor: 'pointer', padding: '4px 10px' }}>
+                    재분석
+                  </button>}
+                  <button onClick={() => setAiSheetOpen(false)} style={{ padding: 8, background: 'none', border: 'none', cursor: 'pointer' }}>
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                  </button>
+                </div>
+              </div>
+
+              {/* 본문 */}
+              <div style={{ padding: '20px' }}>
+                {aiLoading && (
+                  <div style={{ textAlign: 'center', padding: '32px 0', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12 }}>
+                    <Loader2 size={32} className="animate-spin" style={{ color: '#a8a29e' }}/>
+                    <div style={{ fontSize: 13, fontFamily: 'monospace', color: '#a8a29e' }}>Gemini 분석 중...</div>
+                    <div style={{ fontSize: 11, color: '#d6d3d1' }}>현재가 · 재무지표 · 수급 · 뉴스 종합 분석</div>
+                  </div>
+                )}
+
+                {!aiLoading && !aiOpinion && (
+                  <div style={{ textAlign: 'center', padding: '24px 0', fontSize: 13, color: '#a8a29e' }}>
+                    의견을 불러올 수 없습니다
+                  </div>
+                )}
+
+                {!aiLoading && aiOpinion && (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+                    {/* verdict + summary */}
+                    <div style={{ background: vs.bg, border: `2px solid ${vs.border}`, padding: '16px' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+                        <span style={{ background: vs.badge, color: '#fff', fontWeight: 900, fontSize: 13, padding: '5px 12px' }}>
+                          {aiOpinion.verdict}
+                        </span>
+                        <span style={{ fontSize: 14, fontWeight: 700, color: vs.text }}>{aiOpinion.summary}</span>
+                      </div>
+                    </div>
+
+                    {/* 근거 */}
+                    {aiOpinion.reasons?.length > 0 && (
+                      <div>
+                        <div style={{ fontSize: 11, fontWeight: 900, letterSpacing: '0.1em', color: '#a8a29e', marginBottom: 10 }}>분석 근거</div>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                          {aiOpinion.reasons.map((r, i) => (
+                            <div key={i} style={{ display: 'flex', gap: 10, alignItems: 'flex-start' }}>
+                              <span style={{ background: '#1c1917', color: '#fff', fontSize: 10, fontWeight: 900, width: 18, height: 18, borderRadius: 9, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, marginTop: 1 }}>{i+1}</span>
+                              <span style={{ fontSize: 13, color: '#44403c', lineHeight: 1.6 }}>{r}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* 리스크 */}
+                    {aiOpinion.risk && (
+                      <div style={{ background: '#fffbeb', border: '1px solid #fcd34d', padding: '12px 14px', display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+                        <span style={{ fontSize: 14, flexShrink: 0 }}>⚠️</span>
+                        <span style={{ fontSize: 12, color: '#92400e', lineHeight: 1.5 }}>{aiOpinion.risk}</span>
+                      </div>
+                    )}
+
+                    {/* 면책 + 시각 */}
+                    <div style={{ borderTop: '1px solid #e7e5e4', paddingTop: 12, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                      <div style={{ fontSize: 10, color: '#d6d3d1', fontFamily: 'monospace' }}>
+                        {new Date(aiOpinion.generatedAt * 1000).toLocaleTimeString('ko-KR')} 분석 · 1시간 캐시
+                      </div>
+                      <div style={{ fontSize: 10, color: '#d6d3d1', lineHeight: 1.5 }}>
+                        본 의견은 AI 생성 정보로 투자 판단의 참고용이며, 실제 투자 결과에 대한 책임을 지지 않습니다.
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
       {alertModal.open && <AlertModal stock={alertModal.stock} draft={alertDraft} setDraft={setAlertDraft} onSave={saveAlert} onClear={clearAlert} onClose={() => setAlertModal({ open:false, stock:null })} pushStatus={pushStatus}/>}
     </div>
   );
@@ -820,7 +1024,7 @@ function StockTracker() {
                   {watchlist.map(s => {
                     const cp = currentPrices[s.c];
                     return (
-                      <li key={s.c}>
+                      <li key={s.c} className={cp?.flash === 'up' ? 'flash-up' : cp?.flash === 'down' ? 'flash-down' : ''}>
                         <div className="flex items-stretch bg-white border-2 border-stone-200 active:border-stone-900 transition-colors">
                           <button className="flex-1 text-left px-4 py-4 min-w-0" onClick={() => openDetail(s)}>
                             <div className="flex items-center justify-between gap-2">
@@ -854,7 +1058,11 @@ function StockTracker() {
                     );
                   })}
                 </ul>
-                <div className="mono text-[10px] text-stone-400 text-center mt-6">60초마다 자동 갱신 · 탭하면 차트 조회</div>
+                <div className="mono text-[10px] text-stone-400 text-center mt-6 flex items-center justify-center gap-1.5">
+                  <span className="live-dot"></span>
+                  <span>실시간 · 5초마다 갱신</span>
+                  {liveUpdatedAt && <span>· {new Date(liveUpdatedAt).toLocaleTimeString('ko-KR')}</span>}
+                </div>
               </>
             )
         }
