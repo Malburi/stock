@@ -1211,29 +1211,46 @@ async def discover_theme_detail(no: str):
     return out
 
 
+def _classify_dart(title: str) -> str:
+    t = title
+    if any(k in t for k in ("잠정실적", "손익구조", "매출액또는손익")): return "잠정실적"
+    if "주주총회" in t: return "주주총회"
+    if "유상증자" in t: return "유상증자"
+    if "무상증자" in t: return "무상증자"
+    if "자기주식취득" in t: return "자사주매입"
+    if "자기주식처분" in t: return "자사주처분"
+    if "합병" in t: return "합병"
+    if "분할" in t: return "분할"
+    if "전환사채" in t: return "전환사채"
+    if "신주인수권부사채" in t or "BW" in t: return "신주인수권"
+    if "배당" in t: return "배당"
+    if "최대주주" in t: return "최대주주변경"
+    return "주요공시"
+
+
 def _fetch_earnings_dart(dart_key: str) -> list:
-    """DART 전자공시 API - 사업/반기/분기보고서 (A·B·C 타입) 최근 14일."""
+    """DART 주요사항보고서(E타입) — 잠정실적·주주총회·유증·자사주 등 투자 핵심 공시.
+    주주총회 소집공고는 회의 2~4주 전 사전 공시되므로 30일치 조회로 예정 이벤트 파악 가능.
+    """
     today = datetime.now()
-    bgn = (today - timedelta(days=7)).strftime("%Y%m%d")
-    end = (today + timedelta(days=14)).strftime("%Y%m%d")
-    items = []
+    bgn = (today - timedelta(days=30)).strftime("%Y%m%d")
+    end = today.strftime("%Y%m%d")
     name_map = {s["c"]: s["n"] for s in _stock_db}
     market_map = {s["c"]: s["m"] for s in _stock_db}
+    items = []
     seen = set()
-    for pblntf_ty in ("A", "B", "C"):  # 사업/반기/분기보고서
-        try:
-            params = {
-                "crtfc_key": dart_key,
-                "bgn_de": bgn,
-                "end_de": end,
-                "pblntf_ty": pblntf_ty,
-                "page_count": 40,
-            }
-            res = requests.get("https://opendart.fss.or.kr/api/list.json", params=params, timeout=10)
-            res.raise_for_status()
-            j = res.json()
-            if j.get("status") != "000":
-                continue
+    try:
+        params = {
+            "crtfc_key": dart_key,
+            "bgn_de": bgn,
+            "end_de": end,
+            "pblntf_ty": "E",   # 주요사항보고서
+            "page_count": 100,
+        }
+        res = requests.get("https://opendart.fss.or.kr/api/list.json", params=params, timeout=10)
+        res.raise_for_status()
+        j = res.json()
+        if j.get("status") == "000":
             for d in j.get("list", []):
                 rcpt = d.get("rcept_no", "")
                 if rcpt in seen:
@@ -1242,18 +1259,20 @@ def _fetch_earnings_dart(dart_key: str) -> list:
                 code = str(d.get("stock_code", "")).zfill(6)
                 if not code or code == "000000":
                     continue
+                title = d.get("report_nm", "")
                 items.append({
                     "date": d.get("rcept_dt", ""),
                     "c": code,
                     "n": d.get("corp_name", name_map.get(code, code)),
                     "m": market_map.get(code, ""),
-                    "title": d.get("report_nm", ""),
+                    "title": title,
+                    "tag": _classify_dart(title),
                     "url": f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rcpt}",
                 })
-        except Exception:
-            continue
+    except Exception:
+        pass
     items.sort(key=lambda x: x["date"], reverse=True)
-    return items[:60]
+    return items[:80]
 
 
 @app.get("/api/discover/earnings")
