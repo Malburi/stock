@@ -852,18 +852,69 @@ def get_prices(code: str, period: str = "1M"):
     return result
 
 
-def _latest_trading_date() -> str:
-    """pykrx 조회 가능한 가장 최근 거래일 반환."""
-    today = datetime.now()
-    for i in range(10):
-        d = (today - timedelta(days=i)).strftime("%Y%m%d")
+def _naver_clean(s: str) -> str:
+    return s.replace(",", "").replace("+", "").replace("%", "").strip()
+
+
+def _fetch_ranking_naver(sosok: str, by: str) -> list:
+    """Naver 시총/거래량 TOP30 스크래핑.
+    sise_market_sum columns(0-based, with rank col):
+      0:순위 1:종목명(link) 2:현재가 3:전일비 4:등락률 5:액면가
+      6:시가총액(억) 7:상장주식수 8:외국인비율 9:거래량 10:PER 11:ROE
+    sise_quant columns:
+      0:순위 1:종목명(link) 2:현재가 3:전일비 4:등락률
+      5:거래량 6:전일거래량 7:? 8:? 9:?
+    """
+    from bs4 import BeautifulSoup
+    ua = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    if by == "marcap":
+        url = f"https://finance.naver.com/sise/sise_market_sum.naver?sosok={sosok}"
+    else:
+        url = f"https://finance.naver.com/sise/sise_quant.naver?sosok={sosok}"
+    res = requests.get(url, headers=ua, timeout=10)
+    res.encoding = "euc-kr"
+    soup = BeautifulSoup(res.text, "html.parser")
+    table = soup.select_one("table.type_2")
+    if not table:
+        return []
+    market = "KOSPI" if sosok == "0" else "KOSDAQ"
+    items = []
+    for row in table.select("tr"):
+        a_tag = row.select_one("td a[href*='code=']")
+        if not a_tag:
+            continue
+        code = a_tag["href"].split("code=")[-1].split("&")[0].zfill(6)
+        tds = row.select("td")
         try:
-            df = pykrx_stock.get_market_cap_by_ticker(d, market="KOSPI")
-            if df is not None and not df.empty:
-                return d
-        except Exception:
-            pass
-    return today.strftime("%Y%m%d")
+            if by == "marcap":
+                close = int(_naver_clean(tds[2].get_text())) if len(tds) > 2 else 0
+                change_pct = float(_naver_clean(tds[4].get_text()) or "0") if len(tds) > 4 else 0.0
+                marcap_raw = _naver_clean(tds[6].get_text()) if len(tds) > 6 else "0"
+                marcap_int = int(marcap_raw) if marcap_raw.isdigit() or (marcap_raw.lstrip('-').isdigit()) else 0
+                volume = int(_naver_clean(tds[9].get_text()) or "0") if len(tds) > 9 else 0
+                marcap_str = f"{marcap_int:,}억"
+            else:
+                close = int(_naver_clean(tds[2].get_text())) if len(tds) > 2 else 0
+                change_pct = float(_naver_clean(tds[4].get_text()) or "0") if len(tds) > 4 else 0.0
+                volume = int(_naver_clean(tds[5].get_text()) or "0") if len(tds) > 5 else 0
+                prev_vol = int(_naver_clean(tds[6].get_text()) or "0") if len(tds) > 6 else 0
+                marcap_int = 0
+                marcap_str = f"{volume:,}주"
+        except (ValueError, IndexError):
+            continue
+        if not close:
+            continue
+        items.append({
+            "c": code,
+            "n": a_tag.get_text(strip=True),
+            "m": market,
+            "close": close,
+            "changePct": change_pct,
+            "volume": volume if by == "volume" else 0,
+            "marcap": marcap_int,
+            "marcapStr": marcap_str,
+        })
+    return items[:30]
 
 
 @app.get("/api/discover/ranking")
@@ -881,67 +932,31 @@ async def discover_ranking(market: str = "KOSPI", by: str = "marcap"):
         if time.time() - ts < RANKING_CACHE_TTL:
             return data
 
+    sosok = "0" if market == "KOSPI" else "1"
     loop = asyncio.get_event_loop()
     try:
-        date = await loop.run_in_executor(None, _latest_trading_date)
-        df = await loop.run_in_executor(
-            None, lambda: pykrx_stock.get_market_cap_by_ticker(date, market=market)
-        )
+        items = await loop.run_in_executor(None, lambda: _fetch_ranking_naver(sosok, by))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"pykrx 조회 실패: {e}")
-
-    if df is None or df.empty:
+        raise HTTPException(status_code=500, detail=f"스크래핑 실패: {e}")
+    if not items:
         raise HTTPException(status_code=503, detail="데이터를 가져올 수 없습니다")
 
-    # 컬럼명 정규화 (버전마다 다를 수 있음)
-    col_map = {}
-    for c in df.columns:
-        cl = c.strip()
-        if cl in ("시가총액", "MktCap"):
-            col_map[c] = "marcap"
-        elif cl in ("거래량", "Volume"):
-            col_map[c] = "volume"
-        elif cl in ("종가", "Close"):
-            col_map[c] = "close"
-    df = df.rename(columns=col_map)
-
-    sort_col = "marcap" if by == "marcap" else "volume"
-    if sort_col not in df.columns:
-        raise HTTPException(status_code=500, detail=f"컬럼 없음: {sort_col}")
-
-    df = df.sort_values(sort_col, ascending=False).head(30)
-
-    # 종목명 매핑
-    name_map = {s["c"]: s["n"] for s in _stock_db}
-    result = []
-    for ticker, row in df.iterrows():
-        code = str(ticker).zfill(6)
-        marcap_val = int(row.get("marcap", 0))
-        result.append({
-            "c": code,
-            "n": name_map.get(code, code),
-            "m": market,
-            "close": int(row.get("close", 0)),
-            "volume": int(row.get("volume", 0)),
-            "marcap": marcap_val,
-            "marcapStr": f"{marcap_val // 100000000:,}억" if marcap_val >= 100000000 else f"{marcap_val:,}",
-        })
-
-    out = {"date": date, "market": market, "by": by, "items": result}
+    out = {"market": market, "by": by, "items": items}
     _ranking_cache[cache_key] = (time.time(), out)
     return out
 
 
 def _fetch_surge_naver() -> list:
-    """Naver 거래량 상위 페이지에서 급등주 스크래핑."""
+    """Naver 등락률 상위(sise_rise) 급등주 스크래핑.
+    columns: 0:순위 1:종목명(link) 2:현재가 3:전일비 4:등락률
+             5:거래량 6:매도호가? 7:0 8:전일거래량 9:0
+    """
     from bs4 import BeautifulSoup
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    ua = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     items = []
-    # 거래량 상위 (KOSPI + KOSDAQ 두 페이지)
-    for sosok in ("0", "1"):  # 0=KOSPI, 1=KOSDAQ
+    for sosok in ("0", "1"):
         try:
-            url = f"https://finance.naver.com/sise/sise_quant.naver?sosok={sosok}"
-            res = requests.get(url, headers=headers, timeout=8)
+            res = requests.get(f"https://finance.naver.com/sise/sise_rise.naver?sosok={sosok}", headers=ua, timeout=8)
             res.encoding = "euc-kr"
             soup = BeautifulSoup(res.text, "html.parser")
             table = soup.select_one("table.type_2")
@@ -949,28 +964,23 @@ def _fetch_surge_naver() -> list:
                 continue
             market = "KOSPI" if sosok == "0" else "KOSDAQ"
             for row in table.select("tr"):
-                tds = row.select("td")
-                if len(tds) < 10:
-                    continue
-                a_tag = tds[1].select_one("a")
+                a_tag = row.select_one("td a[href*='code=']")
                 if not a_tag:
                     continue
-                href = a_tag.get("href", "")
-                code = href.split("code=")[-1] if "code=" in href else ""
-                if not code:
-                    continue
-                def clean(s):
-                    return s.replace(",", "").replace("+", "").replace("%", "").strip()
+                code = a_tag["href"].split("code=")[-1].split("&")[0].zfill(6)
+                tds = row.select("td")
                 try:
-                    close = int(clean(tds[2].get_text()))
-                    change_pct = float(clean(tds[5].get_text()) or "0")
-                    volume = int(clean(tds[9].get_text()) or "0")
-                    prev_volume = int(clean(tds[10].get_text()) or "0") if len(tds) > 10 else 0
+                    close = int(_naver_clean(tds[2].get_text())) if len(tds) > 2 else 0
+                    change_pct = float(_naver_clean(tds[4].get_text()) or "0") if len(tds) > 4 else 0.0
+                    volume = int(_naver_clean(tds[5].get_text()) or "0") if len(tds) > 5 else 0
+                    prev_volume = int(_naver_clean(tds[8].get_text()) or "0") if len(tds) > 8 else 0
                 except (ValueError, IndexError):
+                    continue
+                if not close:
                     continue
                 ratio = round(volume / prev_volume * 100, 1) if prev_volume > 0 else 0
                 items.append({
-                    "c": code.zfill(6),
+                    "c": code,
                     "n": a_tag.get_text(strip=True),
                     "m": market,
                     "close": close,
@@ -981,36 +991,36 @@ def _fetch_surge_naver() -> list:
                 })
         except Exception:
             continue
-    # 거래량비율 높은 순 정렬
-    items.sort(key=lambda x: x["volumeRatio"], reverse=True)
+    items.sort(key=lambda x: x["changePct"], reverse=True)
     return items[:50]
 
 
 @app.get("/api/discover/surge")
 async def discover_surge():
-    """거래량 급등주: 전일 대비 거래량 급증 종목."""
+    """급등주: 오늘 등락률 상위 종목 (Naver sise_rise)."""
     if "surge" in _surge_cache:
         ts, data = _surge_cache["surge"]
         if time.time() - ts < SURGE_CACHE_TTL:
             return data
-
     loop = asyncio.get_event_loop()
     try:
         items = await loop.run_in_executor(None, _fetch_surge_naver)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"스크래핑 실패: {e}")
-
     out = {"items": items}
     _surge_cache["surge"] = (time.time(), out)
     return out
 
 
 def _fetch_themes_naver() -> list:
-    """Naver 테마 페이지 스크래핑."""
+    """Naver 테마 페이지 스크래핑.
+    columns: 0:테마명(link) 1:전일대비 2:최근3일등락률
+             3:상승수 4:하락수 5:보합수 6:대표종목1 7:대표종목2
+    """
     from bs4 import BeautifulSoup
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    ua = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     try:
-        res = requests.get("https://finance.naver.com/sise/theme.naver", headers=headers, timeout=8)
+        res = requests.get("https://finance.naver.com/sise/theme.naver", headers=ua, timeout=8)
         res.encoding = "euc-kr"
         soup = BeautifulSoup(res.text, "html.parser")
         table = soup.select_one("table.type_1")
@@ -1019,7 +1029,7 @@ def _fetch_themes_naver() -> list:
         themes = []
         for row in table.select("tr"):
             tds = row.select("td")
-            if len(tds) < 3:
+            if len(tds) < 2:
                 continue
             a_tag = tds[0].select_one("a")
             if not a_tag:
@@ -1027,17 +1037,20 @@ def _fetch_themes_naver() -> list:
             href = a_tag.get("href", "")
             theme_no = href.split("no=")[-1] if "no=" in href else ""
             try:
-                change_pct = float(tds[1].get_text(strip=True).replace("%", "").replace("+", "") or "0")
+                change_pct = float(_naver_clean(tds[1].get_text()) or "0")
             except ValueError:
                 change_pct = 0.0
-            top_stocks_text = tds[2].get_text(strip=True) if len(tds) > 2 else ""
+            # 대표종목 (tds[6], tds[7])
+            rep1 = tds[6].get_text(strip=True) if len(tds) > 6 else ""
+            rep2 = tds[7].get_text(strip=True) if len(tds) > 7 else ""
+            top_stocks = ", ".join(s for s in [rep1, rep2] if s)
             themes.append({
                 "name": a_tag.get_text(strip=True),
                 "no": theme_no,
                 "changePct": change_pct,
-                "topStocks": top_stocks_text,
+                "topStocks": top_stocks,
+                "url": f"https://finance.naver.com/sise/sise_group_detail.naver?type=theme&no={theme_no}",
             })
-        # 등락률 높은 순 정렬 (상승 테마 우선)
         themes.sort(key=lambda x: x["changePct"], reverse=True)
         return themes[:30]
     except Exception:
@@ -1051,7 +1064,6 @@ async def discover_themes():
         ts, data = _themes_cache["themes"]
         if time.time() - ts < THEMES_CACHE_TTL:
             return data
-
     loop = asyncio.get_event_loop()
     themes = await loop.run_in_executor(None, _fetch_themes_naver)
     out = {"items": themes}
@@ -1060,54 +1072,61 @@ async def discover_themes():
 
 
 def _fetch_earnings_dart(dart_key: str) -> list:
-    """DART 전자공시 API로 7일 내 정기공시(실적) 목록 조회."""
+    """DART 전자공시 API - 사업/반기/분기보고서 (A·B·C 타입) 최근 14일."""
     today = datetime.now()
-    bgn = today.strftime("%Y%m%d")
-    end = (today + timedelta(days=7)).strftime("%Y%m%d")
-    params = {
-        "crtfc_key": dart_key,
-        "bgn_de": bgn,
-        "end_de": end,
-        "pblntf_ty": "F",   # 정기공시 (사업보고서/반기/분기)
-        "page_count": 40,
-    }
-    res = requests.get("https://opendart.fss.or.kr/api/list.json", params=params, timeout=10)
-    res.raise_for_status()
-    j = res.json()
-    if j.get("status") != "000":
-        return []
+    bgn = (today - timedelta(days=7)).strftime("%Y%m%d")
+    end = (today + timedelta(days=14)).strftime("%Y%m%d")
     items = []
     name_map = {s["c"]: s["n"] for s in _stock_db}
-    for d in j.get("list", []):
-        code = str(d.get("stock_code", "")).zfill(6)
-        items.append({
-            "date": d.get("rcept_dt", ""),
-            "c": code,
-            "n": d.get("corp_name", name_map.get(code, code)),
-            "title": d.get("report_nm", ""),
-            "url": f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={d.get('rcept_no', '')}",
-        })
-    return items
+    seen = set()
+    for pblntf_ty in ("A", "B", "C"):  # 사업/반기/분기보고서
+        try:
+            params = {
+                "crtfc_key": dart_key,
+                "bgn_de": bgn,
+                "end_de": end,
+                "pblntf_ty": pblntf_ty,
+                "page_count": 40,
+            }
+            res = requests.get("https://opendart.fss.or.kr/api/list.json", params=params, timeout=10)
+            res.raise_for_status()
+            j = res.json()
+            if j.get("status") != "000":
+                continue
+            for d in j.get("list", []):
+                rcpt = d.get("rcept_no", "")
+                if rcpt in seen:
+                    continue
+                seen.add(rcpt)
+                code = str(d.get("stock_code", "")).zfill(6)
+                items.append({
+                    "date": d.get("rcept_dt", ""),
+                    "c": code,
+                    "n": d.get("corp_name", name_map.get(code, code)),
+                    "title": d.get("report_nm", ""),
+                    "url": f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rcpt}",
+                })
+        except Exception:
+            continue
+    items.sort(key=lambda x: x["date"], reverse=True)
+    return items[:60]
 
 
 @app.get("/api/discover/earnings")
 async def discover_earnings():
-    """IR공시/실적발표 예정 (DART API 필요)."""
+    """사업/반기/분기보고서 최근 제출 목록 (DART API 필요)."""
     key = os.environ.get("DART_API_KEY") or DART_API_KEY
     if not key:
         raise HTTPException(status_code=503, detail="DART_API_KEY 미설정 — dart.fss.or.kr에서 무료 발급 후 환경변수에 추가하세요")
-
     if "earnings" in _earnings_cache:
         ts, data = _earnings_cache["earnings"]
         if time.time() - ts < EARNINGS_CACHE_TTL:
             return data
-
     loop = asyncio.get_event_loop()
     try:
         items = await loop.run_in_executor(None, lambda: _fetch_earnings_dart(key))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DART API 호출 실패: {e}")
-
     out = {"items": items}
     _earnings_cache["earnings"] = (time.time(), out)
     return out
