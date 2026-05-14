@@ -1235,11 +1235,15 @@ function StockTracker() {
           {!discoverLoading && discoverTab === 'surge' && ddata?.items && (
             <div>
               <div className="px-4 py-2 mono text-[11px] text-stone-400 border-b border-stone-100">
-                거래량 급증 종목 {ddata.items.length}개 · 전일 대비 거래량비율 높은 순
+                주가 급등 종목 {ddata.items.length}개 · 전일 대비 등락률 높은 순
               </div>
-              {ddata.items.map(s => (
-                <DiscoverStockCard key={s.c} s={s}
-                  extra={s.volumeRatio > 0 ? `거래량비율 ${s.volumeRatio.toFixed(0)}%` : null}/>
+              {ddata.items.map((s, i) => (
+                <div key={s.c} className="flex items-stretch bg-white border-b border-stone-100">
+                  <div className="w-7 flex items-center justify-center mono text-xs text-stone-300 shrink-0">{i+1}</div>
+                  <div className="flex-1 min-w-0">
+                    <DiscoverStockCard s={s} extra={null}/>
+                  </div>
+                </div>
               ))}
             </div>
           )}
