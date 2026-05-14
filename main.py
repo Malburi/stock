@@ -60,6 +60,7 @@ _vapid_private: str = ""
 # {endpoint_hash: {"sub": {...}, "alerts": {code: {"target": int|None, "stopLoss": int|None, "bigMove": bool}}}}
 _push_subs: dict[str, dict] = {}
 _fired: set = set()  # "hash:code:type:YYYYMMDD"
+_prev_surge_set: set = set()  # 이전 급등주 집합 (거래량 알람 비교용)
 
 def _load_listing(market: str) -> list[dict]:
     df = fdr.StockListing(market)
@@ -142,6 +143,53 @@ def _check_and_push(ep_hash, sub, code, name, rule, price, change_pct, today):
         send("bigMove", f"📊 급등락 경보 — {name}", f"현재가 ₩{price:,}  {sign}{change_pct:.2f}%")
 
 
+async def _surge_alert_worker():
+    """5분마다 급등주 변화 감지 → surgeAlert 구독자에게 푸시."""
+    global _prev_surge_set
+    await asyncio.sleep(120)  # 서버 초기화 대기
+    while True:
+        try:
+            has_subs = any(v.get("surgeAlert") for v in _push_subs.values())
+            if has_subs:
+                loop = asyncio.get_event_loop()
+                items = await loop.run_in_executor(None, _fetch_surge_naver)
+                if items:
+                    new_codes = {s["c"] for s in items[:15]}
+                    if _prev_surge_set:
+                        newly = new_codes - _prev_surge_set
+                        if newly:
+                            from pywebpush import webpush, WebPushException
+                            surge_map = {s["c"]: s for s in items}
+                            for ep_hash, info in list(_push_subs.items()):
+                                if not info.get("surgeAlert"):
+                                    continue
+                                for code in list(newly)[:3]:
+                                    s = surge_map.get(code)
+                                    if not s:
+                                        continue
+                                    sign = "+" if s["changePct"] > 0 else ""
+                                    try:
+                                        webpush(
+                                            subscription_info=info["sub"],
+                                            data=json.dumps({
+                                                "title": f"📈 급등주 — {s['n']}",
+                                                "body": f"₩{s['close']:,}  {sign}{s['changePct']:.1f}%  거래량비율 {s['volumeRatio']:.0f}%",
+                                                "tag": f"surge:{code}",
+                                            }),
+                                            vapid_private_key=_vapid_private,
+                                            vapid_claims={"sub": "mailto:stock-alert@example.com"},
+                                        )
+                                    except WebPushException as e:
+                                        if "410" in str(e) or "404" in str(e):
+                                            _push_subs.pop(ep_hash, None)
+                                    except Exception:
+                                        pass
+                    _prev_surge_set = new_codes
+        except Exception as e:
+            print(f"[surge_alert] 오류: {e}")
+        await asyncio.sleep(300)  # 5분
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _stock_db, _vapid_public, _vapid_private
@@ -164,8 +212,10 @@ async def lifespan(app: FastAPI):
         print(f"[VAPID] 키 로드 실패: {e}")
 
     task = asyncio.create_task(_alert_worker())
+    surge_task = asyncio.create_task(_surge_alert_worker())
     yield
     task.cancel()
+    surge_task.cancel()
 
 
 app = FastAPI(title="한국 주식 트래커", lifespan=lifespan)
@@ -206,6 +256,8 @@ _themes_cache: dict = {}
 THEMES_CACHE_TTL = 300    # 5분
 _earnings_cache: dict = {}
 EARNINGS_CACHE_TTL = 3600 # 1시간
+_theme_detail_cache: dict = {}
+THEME_DETAIL_CACHE_TTL = 300  # 5분
 
 DART_API_KEY = os.environ.get("DART_API_KEY", "")
 
@@ -529,7 +581,8 @@ async def push_subscribe(request: Request):
     if not sub or not sub.get("endpoint"):
         raise HTTPException(status_code=400, detail="subscription 필드 누락")
     ep_hash = hashlib.sha256(sub["endpoint"].encode()).hexdigest()[:16]
-    _push_subs[ep_hash] = {"sub": sub, "alerts": alerts}
+    surge_alert = body.get("surgeAlert", False)
+    _push_subs[ep_hash] = {"sub": sub, "alerts": alerts, "surgeAlert": surge_alert}
     return {"ok": True, "hash": ep_hash}
 
 
@@ -1071,6 +1124,60 @@ async def discover_themes():
     return out
 
 
+def _fetch_theme_stocks(no: str) -> list:
+    """Naver 테마 상세 페이지에서 소속 종목 스크래핑."""
+    from bs4 import BeautifulSoup
+    ua = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    url = f"https://finance.naver.com/sise/sise_group_detail.naver?type=theme&no={no}"
+    res = requests.get(url, headers=ua, timeout=10)
+    res.encoding = "euc-kr"
+    soup = BeautifulSoup(res.text, "html.parser")
+    table = soup.select_one("table.type_5")
+    if not table:
+        return []
+    items = []
+    for row in table.select("tr"):
+        a_tag = row.select_one("td a[href*='code=']")
+        if not a_tag:
+            continue
+        code = a_tag["href"].split("code=")[-1].split("&")[0].zfill(6)
+        tds = row.select("td")
+        try:
+            close = int(_naver_clean(tds[1].get_text())) if len(tds) > 1 else 0
+            change_pct = float(_naver_clean(tds[3].get_text()) or "0") if len(tds) > 3 else 0.0
+        except (ValueError, IndexError):
+            continue
+        if not close:
+            continue
+        db_entry = next((s for s in _stock_db if s["c"] == code), None)
+        market = db_entry["m"] if db_entry else "KOSPI"
+        items.append({
+            "c": code,
+            "n": a_tag.get_text(strip=True),
+            "m": market,
+            "close": close,
+            "changePct": change_pct,
+        })
+    return items
+
+
+@app.get("/api/discover/theme/{no}")
+async def discover_theme_detail(no: str):
+    """테마 소속 종목 조회."""
+    if no in _theme_detail_cache:
+        ts, data = _theme_detail_cache[no]
+        if time.time() - ts < THEME_DETAIL_CACHE_TTL:
+            return data
+    loop = asyncio.get_event_loop()
+    try:
+        items = await loop.run_in_executor(None, lambda: _fetch_theme_stocks(no))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"테마 종목 조회 실패: {e}")
+    out = {"no": no, "items": items}
+    _theme_detail_cache[no] = (time.time(), out)
+    return out
+
+
 def _fetch_earnings_dart(dart_key: str) -> list:
     """DART 전자공시 API - 사업/반기/분기보고서 (A·B·C 타입) 최근 14일."""
     today = datetime.now()
@@ -1078,6 +1185,7 @@ def _fetch_earnings_dart(dart_key: str) -> list:
     end = (today + timedelta(days=14)).strftime("%Y%m%d")
     items = []
     name_map = {s["c"]: s["n"] for s in _stock_db}
+    market_map = {s["c"]: s["m"] for s in _stock_db}
     seen = set()
     for pblntf_ty in ("A", "B", "C"):  # 사업/반기/분기보고서
         try:
@@ -1103,6 +1211,7 @@ def _fetch_earnings_dart(dart_key: str) -> list:
                     "date": d.get("rcept_dt", ""),
                     "c": code,
                     "n": d.get("corp_name", name_map.get(code, code)),
+                    "m": market_map.get(code, ""),
                     "title": d.get("report_nm", ""),
                     "url": f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rcpt}",
                 })
