@@ -60,7 +60,7 @@ _vapid_private: str = ""
 # {endpoint_hash: {"sub": {...}, "alerts": {code: {"target": int|None, "stopLoss": int|None, "bigMove": bool}}}}
 _push_subs: dict[str, dict] = {}
 _fired: set = set()  # "hash:code:type:YYYYMMDD"
-_prev_surge_set: set = set()  # 이전 급등주 집합 (거래량 알람 비교용)
+_vol_snapshots: list = []  # [{ts, data:{code:{vol,close,changePct,n,m}}}] 최대 3개
 
 def _load_listing(market: str) -> list[dict]:
     df = fdr.StockListing(market)
@@ -143,38 +143,98 @@ def _check_and_push(ep_hash, sub, code, name, rule, price, change_pct, today):
         send("bigMove", f"📊 급등락 경보 — {name}", f"현재가 ₩{price:,}  {sign}{change_pct:.2f}%")
 
 
+def _fetch_vol_snapshot() -> dict:
+    """sise_quant 거래량 상위 종목 스냅샷.
+    columns: 0:순위 1:종목명 2:현재가 3:전일비 4:등락률 5:거래량 6:전일거래량
+    """
+    from bs4 import BeautifulSoup
+    ua = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    result = {}
+    for sosok in ("0", "1"):
+        try:
+            res = requests.get(f"https://finance.naver.com/sise/sise_quant.naver?sosok={sosok}", headers=ua, timeout=8)
+            res.encoding = "euc-kr"
+            soup = BeautifulSoup(res.text, "html.parser")
+            table = soup.select_one("table.type_2")
+            if not table:
+                continue
+            market = "KOSPI" if sosok == "0" else "KOSDAQ"
+            for row in table.select("tr"):
+                a_tag = row.select_one("td a[href*='code=']")
+                if not a_tag:
+                    continue
+                code = a_tag["href"].split("code=")[-1].split("&")[0].zfill(6)
+                tds = row.select("td")
+                try:
+                    close = int(_naver_clean(tds[2].get_text()) or "0") if len(tds) > 2 else 0
+                    change_pct = float(_naver_clean(tds[4].get_text()) or "0") if len(tds) > 4 else 0.0
+                    volume = int(_naver_clean(tds[5].get_text()) or "0") if len(tds) > 5 else 0
+                except (ValueError, IndexError):
+                    continue
+                if volume > 0 and close > 0:
+                    result[code] = {
+                        "vol": volume, "close": close, "changePct": change_pct,
+                        "n": a_tag.get_text(strip=True), "m": market,
+                    }
+        except Exception:
+            continue
+    return result
+
+
 async def _surge_alert_worker():
-    """5분마다 급등주 변화 감지 → surgeAlert 구독자에게 푸시."""
-    global _prev_surge_set
-    await asyncio.sleep(120)  # 서버 초기화 대기
+    """5분마다 거래량 스냅샷 → 5분/10분 전 대비 급증 감지 → 푸시."""
+    global _vol_snapshots
+    await asyncio.sleep(120)
     while True:
         try:
             has_subs = any(v.get("surgeAlert") for v in _push_subs.values())
             if has_subs:
                 loop = asyncio.get_event_loop()
-                items = await loop.run_in_executor(None, _fetch_surge_naver)
-                if items:
-                    new_codes = {s["c"] for s in items[:15]}
-                    if _prev_surge_set:
-                        newly = new_codes - _prev_surge_set
-                        if newly:
+                snap_data = await loop.run_in_executor(None, _fetch_vol_snapshot)
+                if snap_data:
+                    _vol_snapshots.append({"ts": time.time(), "data": snap_data})
+                    if len(_vol_snapshots) > 3:
+                        _vol_snapshots.pop(0)
+
+                    if len(_vol_snapshots) >= 2:
+                        curr = _vol_snapshots[-1]["data"]
+                        prev5 = _vol_snapshots[-2]["data"]
+                        prev10 = _vol_snapshots[-3]["data"] if len(_vol_snapshots) >= 3 else None
+
+                        surging = []
+                        for code, cur in curr.items():
+                            if code not in prev5 or cur["changePct"] <= 0:
+                                continue
+                            inc5 = cur["vol"] - prev5[code]["vol"]
+                            if inc5 <= 0:
+                                continue
+                            if prev10 and code in prev10:
+                                inc_prev = prev5[code]["vol"] - prev10[code]["vol"]
+                                # 5분 거래량이 직전 5분의 2.5배 이상
+                                if inc_prev > 0 and inc5 >= inc_prev * 2.5:
+                                    surging.append((code, cur, inc5, inc_prev))
+                            else:
+                                # 10분 데이터 없을 때: 5분 거래량이 현재 총거래량의 8% 이상
+                                if inc5 >= cur["vol"] * 0.08:
+                                    surging.append((code, cur, inc5, 0))
+
+                        surging.sort(key=lambda x: x[2], reverse=True)
+
+                        if surging:
                             from pywebpush import webpush, WebPushException
-                            surge_map = {s["c"]: s for s in items}
                             for ep_hash, info in list(_push_subs.items()):
                                 if not info.get("surgeAlert"):
                                     continue
-                                for code in list(newly)[:3]:
-                                    s = surge_map.get(code)
-                                    if not s:
-                                        continue
-                                    sign = "+" if s["changePct"] > 0 else ""
+                                for code, s_info, inc5, inc_prev in surging[:3]:
+                                    sign = "+" if s_info["changePct"] > 0 else ""
+                                    ratio_txt = f" (직전 5분 대비 {inc5/inc_prev*100:.0f}%↑)" if inc_prev > 0 else ""
                                     try:
                                         webpush(
                                             subscription_info=info["sub"],
                                             data=json.dumps({
-                                                "title": f"📈 급등주 — {s['n']}",
-                                                "body": f"₩{s['close']:,}  {sign}{s['changePct']:.1f}%  거래량비율 {s['volumeRatio']:.0f}%",
-                                                "tag": f"surge:{code}",
+                                                "title": f"📈 거래량 급증 — {s_info['n']}",
+                                                "body": f"₩{s_info['close']:,}  {sign}{s_info['changePct']:.1f}%  5분 +{inc5:,}주{ratio_txt}",
+                                                "tag": f"surge:{code}:{int(time.time()//300)}",
                                             }),
                                             vapid_private_key=_vapid_private,
                                             vapid_claims={"sub": "mailto:stock-alert@example.com"},
@@ -184,10 +244,9 @@ async def _surge_alert_worker():
                                             _push_subs.pop(ep_hash, None)
                                     except Exception:
                                         pass
-                    _prev_surge_set = new_codes
         except Exception as e:
             print(f"[surge_alert] 오류: {e}")
-        await asyncio.sleep(300)  # 5분
+        await asyncio.sleep(300)
 
 
 @asynccontextmanager
@@ -1125,7 +1184,9 @@ async def discover_themes():
 
 
 def _fetch_theme_stocks(no: str) -> list:
-    """Naver 테마 상세 페이지에서 소속 종목 스크래핑."""
+    """Naver 테마 상세 페이지에서 소속 종목 스크래핑.
+    type_5 columns: 0:종목명 1:차트링크 2:현재가 3:전일비 4:등락률 5:매수호가 6:매도호가
+    """
     from bs4 import BeautifulSoup
     ua = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     url = f"https://finance.naver.com/sise/sise_group_detail.naver?type=theme&no={no}"
@@ -1137,14 +1198,18 @@ def _fetch_theme_stocks(no: str) -> list:
         return []
     items = []
     for row in table.select("tr"):
-        a_tag = row.select_one("td a[href*='code=']")
+        # td[0]의 첫 번째 코드 링크만 사용 (td[1] 차트 링크 제외)
+        first_td = row.select_one("td")
+        if not first_td:
+            continue
+        a_tag = first_td.select_one("a[href*='code=']")
         if not a_tag:
             continue
         code = a_tag["href"].split("code=")[-1].split("&")[0].zfill(6)
         tds = row.select("td")
         try:
-            close = int(_naver_clean(tds[1].get_text())) if len(tds) > 1 else 0
-            change_pct = float(_naver_clean(tds[3].get_text()) or "0") if len(tds) > 3 else 0.0
+            close = int(_naver_clean(tds[2].get_text())) if len(tds) > 2 else 0
+            change_pct = float(_naver_clean(tds[4].get_text()) or "0") if len(tds) > 4 else 0.0
         except (ValueError, IndexError):
             continue
         if not close:
@@ -1207,6 +1272,8 @@ def _fetch_earnings_dart(dart_key: str) -> list:
                     continue
                 seen.add(rcpt)
                 code = str(d.get("stock_code", "")).zfill(6)
+                if not code or code == "000000":
+                    continue
                 items.append({
                     "date": d.get("rcept_dt", ""),
                     "c": code,
