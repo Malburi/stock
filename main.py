@@ -60,7 +60,7 @@ _vapid_private: str = ""
 # {endpoint_hash: {"sub": {...}, "alerts": {code: {"target": int|None, "stopLoss": int|None, "bigMove": bool}}}}
 _push_subs: dict[str, dict] = {}
 _fired: set = set()  # "hash:code:type:YYYYMMDD"
-_vol_snapshots: list = []  # [{ts, data:{code:{vol,close,changePct,n,m}}}] 최대 3개
+_price_snapshots: list = []  # [{ts, data:{code:{close,changePct,n,m}}}] 최대 3개 (5분 간격)
 
 def _load_listing(market: str) -> list[dict]:
     df = fdr.StockListing(market)
@@ -143,80 +143,47 @@ def _check_and_push(ep_hash, sub, code, name, rule, price, change_pct, today):
         send("bigMove", f"📊 급등락 경보 — {name}", f"현재가 ₩{price:,}  {sign}{change_pct:.2f}%")
 
 
-def _fetch_vol_snapshot() -> dict:
-    """sise_quant 거래량 상위 종목 스냅샷.
-    columns: 0:순위 1:종목명 2:현재가 3:전일비 4:등락률 5:거래량 6:전일거래량
-    """
-    from bs4 import BeautifulSoup
-    ua = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    result = {}
-    for sosok in ("0", "1"):
-        try:
-            res = requests.get(f"https://finance.naver.com/sise/sise_quant.naver?sosok={sosok}", headers=ua, timeout=8)
-            res.encoding = "euc-kr"
-            soup = BeautifulSoup(res.text, "html.parser")
-            table = soup.select_one("table.type_2")
-            if not table:
-                continue
-            market = "KOSPI" if sosok == "0" else "KOSDAQ"
-            for row in table.select("tr"):
-                a_tag = row.select_one("td a[href*='code=']")
-                if not a_tag:
-                    continue
-                code = a_tag["href"].split("code=")[-1].split("&")[0].zfill(6)
-                tds = row.select("td")
-                try:
-                    close = int(_naver_clean(tds[2].get_text()) or "0") if len(tds) > 2 else 0
-                    change_pct = float(_naver_clean(tds[4].get_text()) or "0") if len(tds) > 4 else 0.0
-                    volume = int(_naver_clean(tds[5].get_text()) or "0") if len(tds) > 5 else 0
-                except (ValueError, IndexError):
-                    continue
-                if volume > 0 and close > 0:
-                    result[code] = {
-                        "vol": volume, "close": close, "changePct": change_pct,
-                        "n": a_tag.get_text(strip=True), "m": market,
-                    }
-        except Exception:
-            continue
-    return result
+def _fetch_price_snapshot() -> dict:
+    """sise_rise(등락률 상위) 스냅샷 — 가격 급등 감지용."""
+    items = _fetch_surge_naver()  # KOSPI+KOSDAQ 등락률 상위 50개
+    return {
+        s["c"]: {"close": s["close"], "changePct": s["changePct"], "n": s["n"], "m": s["m"]}
+        for s in items
+    }
 
 
 async def _surge_alert_worker():
-    """5분마다 거래량 스냅샷 → 5분/10분 전 대비 급증 감지 → 푸시."""
-    global _vol_snapshots
+    """5분마다 등락률 스냅샷 → 5분/10분 전 대비 급등 감지 → 푸시.
+    기준: 5분 내 등락률 3%p 이상 추가 상승.
+    """
+    global _price_snapshots
     await asyncio.sleep(120)
     while True:
         try:
             has_subs = any(v.get("surgeAlert") for v in _push_subs.values())
             if has_subs:
                 loop = asyncio.get_event_loop()
-                snap_data = await loop.run_in_executor(None, _fetch_vol_snapshot)
+                snap_data = await loop.run_in_executor(None, _fetch_price_snapshot)
                 if snap_data:
-                    _vol_snapshots.append({"ts": time.time(), "data": snap_data})
-                    if len(_vol_snapshots) > 3:
-                        _vol_snapshots.pop(0)
+                    _price_snapshots.append({"ts": time.time(), "data": snap_data})
+                    if len(_price_snapshots) > 3:
+                        _price_snapshots.pop(0)
 
-                    if len(_vol_snapshots) >= 2:
-                        curr = _vol_snapshots[-1]["data"]
-                        prev5 = _vol_snapshots[-2]["data"]
-                        prev10 = _vol_snapshots[-3]["data"] if len(_vol_snapshots) >= 3 else None
+                    if len(_price_snapshots) >= 2:
+                        curr  = _price_snapshots[-1]["data"]
+                        prev5 = _price_snapshots[-2]["data"]
+                        prev10 = _price_snapshots[-3]["data"] if len(_price_snapshots) >= 3 else None
 
                         surging = []
                         for code, cur in curr.items():
                             if code not in prev5 or cur["changePct"] <= 0:
                                 continue
-                            inc5 = cur["vol"] - prev5[code]["vol"]
-                            if inc5 <= 0:
+                            delta5 = cur["changePct"] - prev5[code]["changePct"]
+                            if delta5 < 3.0:  # 5분 내 3%p 이상 상승
                                 continue
-                            if prev10 and code in prev10:
-                                inc_prev = prev5[code]["vol"] - prev10[code]["vol"]
-                                # 5분 거래량이 직전 5분의 2.5배 이상
-                                if inc_prev > 0 and inc5 >= inc_prev * 2.5:
-                                    surging.append((code, cur, inc5, inc_prev))
-                            else:
-                                # 10분 데이터 없을 때: 5분 거래량이 현재 총거래량의 8% 이상
-                                if inc5 >= cur["vol"] * 0.08:
-                                    surging.append((code, cur, inc5, 0))
+                            prev5_pct = prev5[code]["changePct"]
+                            prev10_pct = prev10[code]["changePct"] if (prev10 and code in prev10) else prev5_pct
+                            surging.append((code, cur, delta5, prev5_pct, prev10_pct))
 
                         surging.sort(key=lambda x: x[2], reverse=True)
 
@@ -225,15 +192,16 @@ async def _surge_alert_worker():
                             for ep_hash, info in list(_push_subs.items()):
                                 if not info.get("surgeAlert"):
                                     continue
-                                for code, s_info, inc5, inc_prev in surging[:3]:
-                                    sign = "+" if s_info["changePct"] > 0 else ""
-                                    ratio_txt = f" (직전 5분 대비 {inc5/inc_prev*100:.0f}%↑)" if inc_prev > 0 else ""
+                                for code, s_info, delta5, prev5_pct, prev10_pct in surging[:3]:
                                     try:
                                         webpush(
                                             subscription_info=info["sub"],
                                             data=json.dumps({
-                                                "title": f"📈 거래량 급증 — {s_info['n']}",
-                                                "body": f"₩{s_info['close']:,}  {sign}{s_info['changePct']:.1f}%  5분 +{inc5:,}주{ratio_txt}",
+                                                "title": f"🚀 주가 급등 — {s_info['n']}",
+                                                "body": (
+                                                    f"₩{s_info['close']:,}  현재 +{s_info['changePct']:.1f}%\n"
+                                                    f"10분전 {prev10_pct:+.1f}% → 5분전 {prev5_pct:+.1f}% → 지금 +{s_info['changePct']:.1f}%"
+                                                ),
                                                 "tag": f"surge:{code}:{int(time.time()//300)}",
                                             }),
                                             vapid_private_key=_vapid_private,
