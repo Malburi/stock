@@ -12,6 +12,7 @@ import requests
 import xml.etree.ElementTree as ET
 from urllib.parse import quote
 import os, json, hashlib
+from pykrx import stock as pykrx_stock
 # .env 로드 (python-dotenv 없어도 동작, 있으면 env var 자동 주입)
 try:
     from dotenv import load_dotenv; load_dotenv()
@@ -196,6 +197,17 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 _investor_cache: dict = {}
 INVESTOR_CACHE_TTL = 300  # 5분
+
+_ranking_cache: dict = {}
+RANKING_CACHE_TTL = 600   # 10분
+_surge_cache: dict = {}
+SURGE_CACHE_TTL = 300     # 5분
+_themes_cache: dict = {}
+THEMES_CACHE_TTL = 300    # 5분
+_earnings_cache: dict = {}
+EARNINGS_CACHE_TTL = 3600 # 1시간
+
+DART_API_KEY = os.environ.get("DART_API_KEY", "")
 
 # ── KIS OpenAPI 설정 ──────────────────────────────────────────────
 KIS_APP_KEY    = os.environ.get("KIS_APP_KEY", "")
@@ -838,6 +850,267 @@ def get_prices(code: str, period: str = "1M"):
     result = {"prices": prices, "source": "KRX (FinanceDataReader)"}
     _cache[cache_key] = (time.time(), result)
     return result
+
+
+def _latest_trading_date() -> str:
+    """pykrx 조회 가능한 가장 최근 거래일 반환."""
+    today = datetime.now()
+    for i in range(10):
+        d = (today - timedelta(days=i)).strftime("%Y%m%d")
+        try:
+            df = pykrx_stock.get_market_cap_by_ticker(d, market="KOSPI")
+            if df is not None and not df.empty:
+                return d
+        except Exception:
+            pass
+    return today.strftime("%Y%m%d")
+
+
+@app.get("/api/discover/ranking")
+async def discover_ranking(market: str = "KOSPI", by: str = "marcap"):
+    """시총/거래량 TOP30. market=KOSPI|KOSDAQ, by=marcap|volume"""
+    market = market.upper()
+    if market not in ("KOSPI", "KOSDAQ"):
+        raise HTTPException(status_code=400, detail="market은 KOSPI 또는 KOSDAQ")
+    if by not in ("marcap", "volume"):
+        raise HTTPException(status_code=400, detail="by는 marcap 또는 volume")
+
+    cache_key = f"{market}:{by}"
+    if cache_key in _ranking_cache:
+        ts, data = _ranking_cache[cache_key]
+        if time.time() - ts < RANKING_CACHE_TTL:
+            return data
+
+    loop = asyncio.get_event_loop()
+    try:
+        date = await loop.run_in_executor(None, _latest_trading_date)
+        df = await loop.run_in_executor(
+            None, lambda: pykrx_stock.get_market_cap_by_ticker(date, market=market)
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"pykrx 조회 실패: {e}")
+
+    if df is None or df.empty:
+        raise HTTPException(status_code=503, detail="데이터를 가져올 수 없습니다")
+
+    # 컬럼명 정규화 (버전마다 다를 수 있음)
+    col_map = {}
+    for c in df.columns:
+        cl = c.strip()
+        if cl in ("시가총액", "MktCap"):
+            col_map[c] = "marcap"
+        elif cl in ("거래량", "Volume"):
+            col_map[c] = "volume"
+        elif cl in ("종가", "Close"):
+            col_map[c] = "close"
+    df = df.rename(columns=col_map)
+
+    sort_col = "marcap" if by == "marcap" else "volume"
+    if sort_col not in df.columns:
+        raise HTTPException(status_code=500, detail=f"컬럼 없음: {sort_col}")
+
+    df = df.sort_values(sort_col, ascending=False).head(30)
+
+    # 종목명 매핑
+    name_map = {s["c"]: s["n"] for s in _stock_db}
+    result = []
+    for ticker, row in df.iterrows():
+        code = str(ticker).zfill(6)
+        marcap_val = int(row.get("marcap", 0))
+        result.append({
+            "c": code,
+            "n": name_map.get(code, code),
+            "m": market,
+            "close": int(row.get("close", 0)),
+            "volume": int(row.get("volume", 0)),
+            "marcap": marcap_val,
+            "marcapStr": f"{marcap_val // 100000000:,}억" if marcap_val >= 100000000 else f"{marcap_val:,}",
+        })
+
+    out = {"date": date, "market": market, "by": by, "items": result}
+    _ranking_cache[cache_key] = (time.time(), out)
+    return out
+
+
+def _fetch_surge_naver() -> list:
+    """Naver 거래량 상위 페이지에서 급등주 스크래핑."""
+    from bs4 import BeautifulSoup
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    items = []
+    # 거래량 상위 (KOSPI + KOSDAQ 두 페이지)
+    for sosok in ("0", "1"):  # 0=KOSPI, 1=KOSDAQ
+        try:
+            url = f"https://finance.naver.com/sise/sise_quant.naver?sosok={sosok}"
+            res = requests.get(url, headers=headers, timeout=8)
+            res.encoding = "euc-kr"
+            soup = BeautifulSoup(res.text, "html.parser")
+            table = soup.select_one("table.type_2")
+            if not table:
+                continue
+            market = "KOSPI" if sosok == "0" else "KOSDAQ"
+            for row in table.select("tr"):
+                tds = row.select("td")
+                if len(tds) < 10:
+                    continue
+                a_tag = tds[1].select_one("a")
+                if not a_tag:
+                    continue
+                href = a_tag.get("href", "")
+                code = href.split("code=")[-1] if "code=" in href else ""
+                if not code:
+                    continue
+                def clean(s):
+                    return s.replace(",", "").replace("+", "").replace("%", "").strip()
+                try:
+                    close = int(clean(tds[2].get_text()))
+                    change_pct = float(clean(tds[5].get_text()) or "0")
+                    volume = int(clean(tds[9].get_text()) or "0")
+                    prev_volume = int(clean(tds[10].get_text()) or "0") if len(tds) > 10 else 0
+                except (ValueError, IndexError):
+                    continue
+                ratio = round(volume / prev_volume * 100, 1) if prev_volume > 0 else 0
+                items.append({
+                    "c": code.zfill(6),
+                    "n": a_tag.get_text(strip=True),
+                    "m": market,
+                    "close": close,
+                    "changePct": change_pct,
+                    "volume": volume,
+                    "prevVolume": prev_volume,
+                    "volumeRatio": ratio,
+                })
+        except Exception:
+            continue
+    # 거래량비율 높은 순 정렬
+    items.sort(key=lambda x: x["volumeRatio"], reverse=True)
+    return items[:50]
+
+
+@app.get("/api/discover/surge")
+async def discover_surge():
+    """거래량 급등주: 전일 대비 거래량 급증 종목."""
+    if "surge" in _surge_cache:
+        ts, data = _surge_cache["surge"]
+        if time.time() - ts < SURGE_CACHE_TTL:
+            return data
+
+    loop = asyncio.get_event_loop()
+    try:
+        items = await loop.run_in_executor(None, _fetch_surge_naver)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"스크래핑 실패: {e}")
+
+    out = {"items": items}
+    _surge_cache["surge"] = (time.time(), out)
+    return out
+
+
+def _fetch_themes_naver() -> list:
+    """Naver 테마 페이지 스크래핑."""
+    from bs4 import BeautifulSoup
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    try:
+        res = requests.get("https://finance.naver.com/sise/theme.naver", headers=headers, timeout=8)
+        res.encoding = "euc-kr"
+        soup = BeautifulSoup(res.text, "html.parser")
+        table = soup.select_one("table.type_1")
+        if not table:
+            return []
+        themes = []
+        for row in table.select("tr"):
+            tds = row.select("td")
+            if len(tds) < 3:
+                continue
+            a_tag = tds[0].select_one("a")
+            if not a_tag:
+                continue
+            href = a_tag.get("href", "")
+            theme_no = href.split("no=")[-1] if "no=" in href else ""
+            try:
+                change_pct = float(tds[1].get_text(strip=True).replace("%", "").replace("+", "") or "0")
+            except ValueError:
+                change_pct = 0.0
+            top_stocks_text = tds[2].get_text(strip=True) if len(tds) > 2 else ""
+            themes.append({
+                "name": a_tag.get_text(strip=True),
+                "no": theme_no,
+                "changePct": change_pct,
+                "topStocks": top_stocks_text,
+            })
+        # 등락률 높은 순 정렬 (상승 테마 우선)
+        themes.sort(key=lambda x: x["changePct"], reverse=True)
+        return themes[:30]
+    except Exception:
+        return []
+
+
+@app.get("/api/discover/themes")
+async def discover_themes():
+    """당일 테마주 트렌드 (Naver 테마 페이지)."""
+    if "themes" in _themes_cache:
+        ts, data = _themes_cache["themes"]
+        if time.time() - ts < THEMES_CACHE_TTL:
+            return data
+
+    loop = asyncio.get_event_loop()
+    themes = await loop.run_in_executor(None, _fetch_themes_naver)
+    out = {"items": themes}
+    _themes_cache["themes"] = (time.time(), out)
+    return out
+
+
+def _fetch_earnings_dart(dart_key: str) -> list:
+    """DART 전자공시 API로 7일 내 정기공시(실적) 목록 조회."""
+    today = datetime.now()
+    bgn = today.strftime("%Y%m%d")
+    end = (today + timedelta(days=7)).strftime("%Y%m%d")
+    params = {
+        "crtfc_key": dart_key,
+        "bgn_de": bgn,
+        "end_de": end,
+        "pblntf_ty": "F",   # 정기공시 (사업보고서/반기/분기)
+        "page_count": 40,
+    }
+    res = requests.get("https://opendart.fss.or.kr/api/list.json", params=params, timeout=10)
+    res.raise_for_status()
+    j = res.json()
+    if j.get("status") != "000":
+        return []
+    items = []
+    name_map = {s["c"]: s["n"] for s in _stock_db}
+    for d in j.get("list", []):
+        code = str(d.get("stock_code", "")).zfill(6)
+        items.append({
+            "date": d.get("rcept_dt", ""),
+            "c": code,
+            "n": d.get("corp_name", name_map.get(code, code)),
+            "title": d.get("report_nm", ""),
+            "url": f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={d.get('rcept_no', '')}",
+        })
+    return items
+
+
+@app.get("/api/discover/earnings")
+async def discover_earnings():
+    """IR공시/실적발표 예정 (DART API 필요)."""
+    key = os.environ.get("DART_API_KEY") or DART_API_KEY
+    if not key:
+        raise HTTPException(status_code=503, detail="DART_API_KEY 미설정 — dart.fss.or.kr에서 무료 발급 후 환경변수에 추가하세요")
+
+    if "earnings" in _earnings_cache:
+        ts, data = _earnings_cache["earnings"]
+        if time.time() - ts < EARNINGS_CACHE_TTL:
+            return data
+
+    loop = asyncio.get_event_loop()
+    try:
+        items = await loop.run_in_executor(None, lambda: _fetch_earnings_dart(key))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"DART API 호출 실패: {e}")
+
+    out = {"items": items}
+    _earnings_cache["earnings"] = (time.time(), out)
+    return out
 
 
 # 정적 파일은 마지막에 마운트 (API 라우트보다 후순위)

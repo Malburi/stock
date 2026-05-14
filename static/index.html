@@ -236,6 +236,13 @@ function StockTracker() {
   const [watchlist,    setWatchlist]    = useState([]);
   const [ready,        setReady]        = useState(false);
   const [screen,       setScreen]       = useState('list');   // list | search | detail
+  // 탐색 탭
+  const [tab,          setTab]          = useState('watchlist'); // watchlist | discover
+  const [discoverTab,  setDiscoverTab]  = useState('ranking');   // ranking | surge | themes | earnings
+  const [discoverData, setDiscoverData] = useState({});
+  const [discoverLoading, setDiscoverLoading] = useState(false);
+  const [rankingMarket, setRankingMarket] = useState('KOSPI');
+  const [rankingBy,    setRankingBy]    = useState('marcap');
   // 검색
   const [query,        setQuery]        = useState('');
   const [searchResults,setSearchResults]= useState([]);
@@ -417,6 +424,34 @@ function StockTracker() {
     detailTimerRef.current = setInterval(poll, 5000);
     return () => clearInterval(detailTimerRef.current);
   }, [screen, selected?.c]);
+
+  // 탐색 데이터 로드
+  const fetchDiscover = useCallback(async (dtab, mkt, by) => {
+    setDiscoverLoading(true);
+    try {
+      let url;
+      if (dtab === 'ranking') url = `/api/discover/ranking?market=${mkt}&by=${by}`;
+      else if (dtab === 'surge') url = '/api/discover/surge';
+      else if (dtab === 'themes') url = '/api/discover/themes';
+      else if (dtab === 'earnings') url = '/api/discover/earnings';
+      const res = await fetch(url);
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({}));
+        setDiscoverData(prev => ({ ...prev, [dtab]: { error: j.detail || '조회 실패' } }));
+      } else {
+        const data = await res.json();
+        setDiscoverData(prev => ({ ...prev, [dtab]: data }));
+      }
+    } catch {
+      setDiscoverData(prev => ({ ...prev, [dtab]: { error: '네트워크 오류' } }));
+    }
+    setDiscoverLoading(false);
+  }, []);
+
+  useEffect(() => {
+    if (tab !== 'discover') return;
+    fetchDiscover(discoverTab, rankingMarket, rankingBy);
+  }, [tab, discoverTab, rankingMarket, rankingBy]);
 
   // 검색 화면 진입 시 초기화 + 포커스
   useEffect(() => {
@@ -1004,9 +1039,222 @@ function StockTracker() {
     </div>
   );
 
-  // ── 리스트 화면 ────────────────────────────────────────────────
+  // ── 하단 탭 바 ────────────────────────────────────────────────
+  const BottomTabBar = () => (
+    <div style={{
+      position: 'fixed', bottom: 0, left: 0, right: 0, zIndex: 20,
+      display: 'flex', borderTop: '2px solid #1c1917', background: '#fff',
+      paddingBottom: 'env(safe-area-inset-bottom, 0px)',
+    }}>
+      {[
+        { key: 'watchlist', icon: '★', label: '관심종목' },
+        { key: 'discover',  icon: '🔭', label: '탐색' },
+      ].map(t => (
+        <button key={t.key} onClick={() => setTab(t.key)}
+          style={{
+            flex: 1, padding: '10px 0 8px', display: 'flex', flexDirection: 'column',
+            alignItems: 'center', gap: 2, border: 'none', cursor: 'pointer',
+            background: tab === t.key ? '#1c1917' : '#fff',
+            color: tab === t.key ? '#fff' : '#78716c',
+            transition: 'background 0.15s',
+          }}>
+          <span style={{ fontSize: 16 }}>{t.icon}</span>
+          <span style={{ fontSize: 9, fontWeight: 700, letterSpacing: '0.08em', fontFamily: 'monospace' }}>{t.label}</span>
+        </button>
+      ))}
+    </div>
+  );
+
+  // ── 탐색 화면 ─────────────────────────────────────────────────
+  if (tab === 'discover') {
+    const DISCOVER_TABS = [
+      { key: 'ranking',  label: 'TOP30' },
+      { key: 'surge',    label: '급등주' },
+      { key: 'themes',   label: '테마' },
+      { key: 'earnings', label: '공시' },
+    ];
+    const ddata = discoverData[discoverTab];
+
+    const DiscoverStockCard = ({ s, extra }) => {
+      const isAdded = watchlist.some(w => w.c === s.c);
+      return (
+        <div className="flex items-stretch bg-white border-b border-stone-100">
+          <button className="flex-1 text-left px-4 py-3 min-w-0" onClick={() => openDetail(s)}>
+            <div className="flex items-center justify-between gap-2">
+              <div className="font-bold text-sm truncate">{s.n}</div>
+              {s.close ? (
+                <div className="text-right shrink-0">
+                  <div className={`mono font-black text-sm ${cc(s.changePct)}`}>₩{fp(s.close)}</div>
+                  <div className={`mono text-xs ${cc(s.changePct)}`}>{s.changePct > 0 ? '+' : ''}{s.changePct?.toFixed(2)}%</div>
+                </div>
+              ) : null}
+            </div>
+            <div className="mono text-xs text-stone-400 mt-0.5">{s.c} · {s.m}{extra ? <span className="ml-2 text-stone-300">{extra}</span> : null}</div>
+          </button>
+          <button onClick={() => isAdded ? null : addStock(s)}
+            className={`px-3 border-l border-stone-100 text-xs font-bold shrink-0 ${isAdded ? 'text-stone-300' : 'text-stone-900 active:bg-stone-50'}`}>
+            {isAdded ? '등록됨' : '+관심'}
+          </button>
+        </div>
+      );
+    };
+
+    return (
+      <div className="min-h-screen bg-stone-50" style={{ ...BASE, paddingBottom: 56 }}>
+        <header className="sticky top-0 z-10 bg-white border-b-2 border-stone-900">
+          <div className="px-4 py-3 flex items-center justify-between">
+            <div>
+              <div className="text-[10px] tracking-[0.25em] text-stone-400 mb-0.5">KOREA STOCK</div>
+              <h1 className="text-lg font-black">탐색</h1>
+            </div>
+            <button onClick={() => fetchDiscover(discoverTab, rankingMarket, rankingBy)}
+                    disabled={discoverLoading}
+                    className="p-2 rounded active:bg-stone-100 disabled:opacity-40">
+              <RefreshCw size={18} className={discoverLoading ? 'animate-spin' : ''}/>
+            </button>
+          </div>
+          {/* 서브탭 */}
+          <div className="flex border-t border-stone-100">
+            {DISCOVER_TABS.map(t => (
+              <button key={t.key} onClick={() => setDiscoverTab(t.key)}
+                className={`flex-1 py-2.5 text-xs font-bold border-b-2 transition-colors ${
+                  discoverTab === t.key ? 'border-stone-900 text-stone-900' : 'border-transparent text-stone-400'
+                }`}>
+                {t.label}
+              </button>
+            ))}
+          </div>
+          {/* TOP30 옵션 */}
+          {discoverTab === 'ranking' && (
+            <div className="flex gap-2 px-4 py-2 border-t border-stone-100">
+              {['KOSPI', 'KOSDAQ'].map(m => (
+                <button key={m} onClick={() => setRankingMarket(m)}
+                  className={`px-3 py-1 text-xs font-bold border-2 ${rankingMarket === m ? 'bg-stone-900 text-white border-stone-900' : 'border-stone-200 text-stone-500'}`}>
+                  {m}
+                </button>
+              ))}
+              <div className="flex-1"/>
+              {[['marcap','시가총액'],['volume','거래량']].map(([v,l]) => (
+                <button key={v} onClick={() => setRankingBy(v)}
+                  className={`px-3 py-1 text-xs font-bold border-2 ${rankingBy === v ? 'bg-stone-900 text-white border-stone-900' : 'border-stone-200 text-stone-500'}`}>
+                  {l}
+                </button>
+              ))}
+            </div>
+          )}
+        </header>
+
+        <main>
+          {discoverLoading && (
+            <div className="p-12 text-center">
+              <Loader2 className="animate-spin mx-auto text-stone-400 mb-3" size={28}/>
+              <div className="text-sm text-stone-400">
+                {discoverTab === 'ranking' ? 'KRX 데이터 조회 중... (최초 1회 수십 초 소요)' : '조회 중...'}
+              </div>
+            </div>
+          )}
+
+          {!discoverLoading && ddata?.error && (
+            <div className="m-4 bg-red-50 border-2 border-red-400 p-4">
+              <div className="text-sm font-bold text-red-700 mb-1">조회 실패</div>
+              <div className="text-xs text-red-600">{ddata.error}</div>
+              {discoverTab === 'earnings' && ddata.error.includes('DART_API_KEY') && (
+                <div className="text-xs text-stone-500 mt-2 leading-relaxed">
+                  DART API 키를 발급받아 환경변수 <code className="bg-stone-100 px-1">DART_API_KEY</code>에 설정하세요.<br/>
+                  발급: opendart.fss.or.kr (무료)
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* TOP30 */}
+          {!discoverLoading && discoverTab === 'ranking' && ddata?.items && (
+            <div>
+              <div className="px-4 py-2 mono text-[11px] text-stone-400 border-b border-stone-100 flex justify-between">
+                <span>{rankingMarket} {rankingBy === 'marcap' ? '시가총액' : '거래량'} 상위 {ddata.items.length}개</span>
+                {ddata.date && <span>기준일: {ddata.date.slice(0,4)}.{ddata.date.slice(4,6)}.{ddata.date.slice(6)}</span>}
+              </div>
+              {ddata.items.map((s, i) => (
+                <div key={s.c} className="flex items-stretch bg-white border-b border-stone-100">
+                  <div className="w-8 flex items-center justify-center mono text-xs text-stone-300 shrink-0">{i+1}</div>
+                  <div className="flex-1 min-w-0">
+                    <DiscoverStockCard s={s} extra={rankingBy === 'marcap' ? s.marcapStr : `${(s.volume/10000).toFixed(0)}만주`}/>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* 급등주 */}
+          {!discoverLoading && discoverTab === 'surge' && ddata?.items && (
+            <div>
+              <div className="px-4 py-2 mono text-[11px] text-stone-400 border-b border-stone-100">
+                거래량 급증 종목 {ddata.items.length}개 · 전일 대비 거래량비율 높은 순
+              </div>
+              {ddata.items.map(s => (
+                <DiscoverStockCard key={s.c} s={s}
+                  extra={s.volumeRatio > 0 ? `거래량비율 ${s.volumeRatio.toFixed(0)}%` : null}/>
+              ))}
+            </div>
+          )}
+
+          {/* 테마 */}
+          {!discoverLoading && discoverTab === 'themes' && ddata?.items && (
+            <div>
+              <div className="px-4 py-2 mono text-[11px] text-stone-400 border-b border-stone-100">
+                당일 테마 {ddata.items.length}개 · 등락률 높은 순
+              </div>
+              {ddata.items.map((t, i) => (
+                <div key={i} className="border-b border-stone-100 bg-white px-4 py-3">
+                  <div className="flex items-center justify-between">
+                    <div className="font-bold text-sm">{t.name}</div>
+                    <div className={`mono text-sm font-black ${cc(t.changePct)}`}>
+                      {t.changePct > 0 ? '+' : ''}{t.changePct?.toFixed(2)}%
+                    </div>
+                  </div>
+                  {t.topStocks && (
+                    <div className="mono text-xs text-stone-400 mt-1 truncate">{t.topStocks}</div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* 공시 */}
+          {!discoverLoading && discoverTab === 'earnings' && ddata?.items && (
+            <div>
+              <div className="px-4 py-2 mono text-[11px] text-stone-400 border-b border-stone-100">
+                향후 7일 정기공시 {ddata.items.length}건
+              </div>
+              {ddata.items.length === 0 && (
+                <div className="p-8 text-center text-sm text-stone-400">예정 공시가 없습니다</div>
+              )}
+              {ddata.items.map((d, i) => (
+                <a key={i} href={d.url} target="_blank" rel="noopener noreferrer"
+                   className="block border-b border-stone-100 bg-white px-4 py-3 active:bg-stone-50">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="flex-1 min-w-0">
+                      <div className="font-bold text-sm truncate">{d.n}</div>
+                      <div className="text-xs text-stone-600 mt-0.5 leading-snug line-clamp-2">{d.title}</div>
+                    </div>
+                    <div className="mono text-[10px] text-stone-400 shrink-0 text-right">
+                      {d.date ? d.date.slice(0,4)+'.'+d.date.slice(4,6)+'.'+d.date.slice(6) : ''}
+                    </div>
+                  </div>
+                </a>
+              ))}
+            </div>
+          )}
+        </main>
+
+        <BottomTabBar/>
+      </div>
+    );
+  }
+
+  // ── 관심종목 리스트 화면 ────────────────────────────────────────
   return (
-    <div className="min-h-screen bg-stone-50" style={BASE}>
+    <div className="min-h-screen bg-stone-50" style={{ ...BASE, paddingBottom: 56 }}>
       <header className="sticky top-0 z-10 bg-white border-b-2 border-stone-900">
         <div className="px-4 py-4 flex items-center justify-between">
           <div>
@@ -1109,6 +1357,7 @@ function StockTracker() {
         }
       </main>
       {alertModal.open && <AlertModal stock={alertModal.stock} draft={alertDraft} setDraft={setAlertDraft} onSave={saveAlert} onClear={clearAlert} onClose={() => setAlertModal({ open:false, stock:null })} pushStatus={pushStatus}/>}
+      <BottomTabBar/>
     </div>
   );
 }
