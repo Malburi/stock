@@ -262,10 +262,12 @@ function StockTracker() {
   const [alertDraft,   setAlertDraft]   = useState({ target: '', stopLoss: '', bigMove: false });
   const [pushStatus,   setPushStatus]   = useState('idle'); // idle|requesting|ok|error
   const [liveUpdatedAt, setLiveUpdatedAt] = useState(null);
-  const searchRef  = useRef(null);
-  const indexTimer = useRef(null);
-  const swRegRef   = useRef(null);
-  const esRef      = useRef(null);
+  const [detailUpdatedAt, setDetailUpdatedAt] = useState(null);
+  const searchRef      = useRef(null);
+  const indexTimer     = useRef(null);
+  const swRegRef       = useRef(null);
+  const esRef          = useRef(null);
+  const detailTimerRef = useRef(null);
 
   // 초기 로드
   useEffect(() => {
@@ -380,6 +382,41 @@ function StockTracker() {
     return () => clearInterval(indexTimer.current);
   }, []);
 
+  // 상세화면 전용 실시간 가격 폴링 (5초마다 /api/current/{code})
+  useEffect(() => {
+    if (screen !== 'detail' || !selected) {
+      clearInterval(detailTimerRef.current);
+      setDetailUpdatedAt(null);
+      return;
+    }
+    const poll = async () => {
+      try {
+        const res = await fetch(`/api/current/${selected.c}`);
+        if (!res.ok) return;
+        const price = await res.json();
+        setCurrentPrices(prev => {
+          const old = prev[selected.c];
+          const changed = old?.close != null && price.close !== old.close;
+          return {
+            ...prev,
+            [selected.c]: {
+              ...price,
+              loading: false,
+              flash: changed ? (price.close > old.close ? 'up' : 'down') : (old?.flash ?? null),
+            },
+          };
+        });
+        setDetailUpdatedAt(Date.now());
+        setTimeout(() => setCurrentPrices(prev => ({
+          ...prev,
+          [selected.c]: prev[selected.c] ? { ...prev[selected.c], flash: null } : prev[selected.c],
+        })), 1300);
+      } catch {}
+    };
+    poll();
+    detailTimerRef.current = setInterval(poll, 5000);
+    return () => clearInterval(detailTimerRef.current);
+  }, [screen, selected?.c]);
 
   // 검색 화면 진입 시 초기화 + 포커스
   useEffect(() => {
@@ -754,6 +791,10 @@ function StockTracker() {
                 {fChange(dispChange, dispChangePct)}
               </div>
               {latest && <div className="mono text-xs text-stone-500 mt-3">전일종가 기준 {latest.date}</div>}
+              <div className="mono text-[10px] text-green-400 mt-1 flex items-center gap-1.5">
+                <span>5초마다 갱신</span>
+                {detailUpdatedAt && <span>· {new Date(detailUpdatedAt).toLocaleTimeString('ko-KR')}</span>}
+              </div>
             </div>
 
             {chartData.length > 1 && (

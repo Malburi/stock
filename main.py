@@ -649,13 +649,20 @@ async def stream_prices(codes: str = ""):
                     for code in code_list
                 ]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
-                prices = {
-                    code: result
-                    for code, result in zip(code_list, results)
-                    if not isinstance(result, Exception)
-                }
+                now = time.time()
+                prices = {}
+                for code, result in zip(code_list, results):
+                    if not isinstance(result, Exception):
+                        prices[code] = result
+                        _current_cache[code] = (now, result)  # SSE 결과를 캐시에 저장
+                    elif code in _current_cache:
+                        ts, cached = _current_cache[code]
+                        if now - ts < 60:  # 네이버 실패 시 최대 60초 캐시 폴백
+                            prices[code] = cached
                 if prices:
                     yield f"data: {json.dumps(prices)}\n\n"
+                else:
+                    yield ": keepalive\n\n"
             else:
                 yield ": keepalive\n\n"
             await asyncio.sleep(5)
