@@ -1026,23 +1026,28 @@ async def discover_ranking(market: str = "KOSPI", by: str = "marcap"):
     return out
 
 
-def _fetch_surge_naver() -> list:
-    """Naver 등락률 상위(sise_rise) 급등주 스크래핑.
-    columns: 0:순위 1:종목명(link) 2:현재가 3:전일비 4:등락률
-             5:거래량 6:매도호가? 7:0 8:전일거래량 9:0
+def _fetch_surge_naver(sosok: str = "both", by: str = "price") -> list:
+    """급등주 스크래핑.
+    by=price → sise_rise (등락률 상위): td[4]=등락률, td[5]=거래량, td[8]=전일거래량
+    by=volume → sise_quant (거래량 상위): td[4]=등락률, td[5]=거래량, td[6]=전일거래량
     """
     from bs4 import BeautifulSoup
     ua = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    sosok_list = ["0", "1"] if sosok == "both" else [sosok]
     items = []
-    for sosok in ("0", "1"):
+    for s in sosok_list:
         try:
-            res = requests.get(f"https://finance.naver.com/sise/sise_rise.naver?sosok={sosok}", headers=ua, timeout=8)
+            if by == "price":
+                url = f"https://finance.naver.com/sise/sise_rise.naver?sosok={s}"
+            else:
+                url = f"https://finance.naver.com/sise/sise_quant.naver?sosok={s}"
+            res = requests.get(url, headers=ua, timeout=8)
             res.encoding = "euc-kr"
             soup = BeautifulSoup(res.text, "html.parser")
             table = soup.select_one("table.type_2")
             if not table:
                 continue
-            market = "KOSPI" if sosok == "0" else "KOSDAQ"
+            market = "KOSPI" if s == "0" else "KOSDAQ"
             for row in table.select("tr"):
                 a_tag = row.select_one("td a[href*='code=']")
                 if not a_tag:
@@ -1053,42 +1058,48 @@ def _fetch_surge_naver() -> list:
                     close = int(_naver_clean(tds[2].get_text())) if len(tds) > 2 else 0
                     change_pct = float(_naver_clean(tds[4].get_text()) or "0") if len(tds) > 4 else 0.0
                     volume = int(_naver_clean(tds[5].get_text()) or "0") if len(tds) > 5 else 0
-                    prev_volume = int(_naver_clean(tds[8].get_text()) or "0") if len(tds) > 8 else 0
+                    prev_vol_idx = 8 if by == "price" else 6
+                    prev_volume = int(_naver_clean(tds[prev_vol_idx].get_text()) or "0") if len(tds) > prev_vol_idx else 0
                 except (ValueError, IndexError):
                     continue
                 if not close:
                     continue
                 ratio = round(volume / prev_volume * 100, 1) if prev_volume > 0 else 0
                 items.append({
-                    "c": code,
-                    "n": a_tag.get_text(strip=True),
-                    "m": market,
-                    "close": close,
-                    "changePct": change_pct,
-                    "volume": volume,
-                    "prevVolume": prev_volume,
-                    "volumeRatio": ratio,
+                    "c": code, "n": a_tag.get_text(strip=True), "m": market,
+                    "close": close, "changePct": change_pct,
+                    "volume": volume, "prevVolume": prev_volume, "volumeRatio": ratio,
                 })
         except Exception:
             continue
-    items.sort(key=lambda x: x["changePct"], reverse=True)
+    if by == "price":
+        items.sort(key=lambda x: x["changePct"], reverse=True)
+    else:
+        items.sort(key=lambda x: x["volume"], reverse=True)
     return items[:50]
 
 
 @app.get("/api/discover/surge")
-async def discover_surge():
-    """급등주: 오늘 등락률 상위 종목 (Naver sise_rise)."""
-    if "surge" in _surge_cache:
-        ts, data = _surge_cache["surge"]
+async def discover_surge(market: str = "BOTH", by: str = "price"):
+    """급등주. market=KOSPI|KOSDAQ|BOTH, by=price|volume"""
+    market = market.upper()
+    if market not in ("KOSPI", "KOSDAQ", "BOTH"):
+        market = "BOTH"
+    if by not in ("price", "volume"):
+        by = "price"
+    sosok = {"KOSPI": "0", "KOSDAQ": "1", "BOTH": "both"}[market]
+    cache_key = f"surge:{market}:{by}"
+    if cache_key in _surge_cache:
+        ts, data = _surge_cache[cache_key]
         if time.time() - ts < SURGE_CACHE_TTL:
             return data
     loop = asyncio.get_event_loop()
     try:
-        items = await loop.run_in_executor(None, _fetch_surge_naver)
+        items = await loop.run_in_executor(None, lambda: _fetch_surge_naver(sosok, by))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"스크래핑 실패: {e}")
-    out = {"items": items}
-    _surge_cache["surge"] = (time.time(), out)
+    out = {"items": items, "market": market, "by": by}
+    _surge_cache[cache_key] = (time.time(), out)
     return out
 
 

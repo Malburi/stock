@@ -243,6 +243,8 @@ function StockTracker() {
   const [discoverLoading, setDiscoverLoading] = useState(false);
   const [rankingMarket, setRankingMarket] = useState('KOSPI');
   const [rankingBy,    setRankingBy]    = useState('marcap');
+  const [surgeMarket,  setSurgeMarket]  = useState('BOTH');
+  const [surgeBy,      setSurgeBy]      = useState('price');
   // 테마 종목 펼치기
   const [expandedTheme, setExpandedTheme] = useState(null);
   const [themeStocksData, setThemeStocksData] = useState({});
@@ -438,7 +440,7 @@ function StockTracker() {
     try {
       let url;
       if (dtab === 'ranking') url = `/api/discover/ranking?market=${mkt}&by=${by}`;
-      else if (dtab === 'surge') url = '/api/discover/surge';
+      else if (dtab === 'surge') url = `/api/discover/surge?market=${surgeMarket}&by=${surgeBy}`;
       else if (dtab === 'themes') url = '/api/discover/themes';
       else if (dtab === 'earnings') url = '/api/discover/earnings';
       const res = await fetch(url);
@@ -453,12 +455,12 @@ function StockTracker() {
       setDiscoverData(prev => ({ ...prev, [dtab]: { error: '네트워크 오류' } }));
     }
     setDiscoverLoading(false);
-  }, []);
+  }, [surgeMarket, surgeBy]);
 
   useEffect(() => {
     if (tab !== 'discover') return;
     fetchDiscover(discoverTab, rankingMarket, rankingBy);
-  }, [tab, discoverTab, rankingMarket, rankingBy]);
+  }, [tab, discoverTab, rankingMarket, rankingBy, surgeMarket, surgeBy]);
 
   const toggleTheme = useCallback(async (t) => {
     if (expandedTheme === t.no) { setExpandedTheme(null); return; }
@@ -1153,21 +1155,41 @@ function StockTracker() {
               </button>
             ))}
           </div>
-          {/* 급등주 알람 토글 */}
+          {/* 급등주 옵션 */}
           {discoverTab === 'surge' && (
-            <div className="flex items-center justify-between px-4 py-2 border-t border-stone-100">
-              <div>
-                <span className="text-xs font-bold text-stone-700">급등 알림</span>
-                <span className="mono text-[10px] text-stone-400 ml-2">5분 내 등락률 3%p↑ 감지</span>
+            <div className="border-t border-stone-100 px-4 py-2 flex flex-col gap-2">
+              <div className="flex items-center gap-2">
+                <span className="mono text-[10px] text-stone-400 w-8 shrink-0">시장</span>
+                {[['BOTH','전체'],['KOSPI','KOSPI'],['KOSDAQ','KOSDAQ']].map(([v,l]) => (
+                  <button key={v} onClick={() => setSurgeMarket(v)}
+                    className={`px-2.5 py-1 text-xs font-bold border-2 ${surgeMarket===v ? 'bg-stone-900 text-white border-stone-900' : 'border-stone-200 text-stone-500'}`}>
+                    {l}
+                  </button>
+                ))}
               </div>
-              <button onClick={toggleSurgeAlert}
-                style={{ position:'relative', width:44, height:24, borderRadius:12,
-                         background: surgeAlertEnabled ? '#1c1917' : '#d6d3d1',
-                         border:'none', cursor:'pointer', flexShrink:0, transition:'background 0.2s' }}>
-                <span style={{ position:'absolute', top:4, left: surgeAlertEnabled ? 24 : 4,
-                               width:16, height:16, borderRadius:8, background:'white',
-                               transition:'left 0.2s', display:'block' }}/>
-              </button>
+              <div className="flex items-center gap-2">
+                <span className="mono text-[10px] text-stone-400 w-8 shrink-0">기준</span>
+                {[['price','주가 급등'],['volume','거래량 급등']].map(([v,l]) => (
+                  <button key={v} onClick={() => setSurgeBy(v)}
+                    className={`px-2.5 py-1 text-xs font-bold border-2 ${surgeBy===v ? 'bg-stone-900 text-white border-stone-900' : 'border-stone-200 text-stone-500'}`}>
+                    {l}
+                  </button>
+                ))}
+              </div>
+              <div className="flex items-center justify-between pt-0.5">
+                <div>
+                  <span className="text-xs font-bold text-stone-700">급등 알림</span>
+                  <span className="mono text-[10px] text-stone-400 ml-2">5분 내 주가 3%p↑ 감지</span>
+                </div>
+                <button onClick={toggleSurgeAlert}
+                  style={{ position:'relative', width:44, height:24, borderRadius:12,
+                           background: surgeAlertEnabled ? '#1c1917' : '#d6d3d1',
+                           border:'none', cursor:'pointer', flexShrink:0, transition:'background 0.2s' }}>
+                  <span style={{ position:'absolute', top:4, left: surgeAlertEnabled ? 24 : 4,
+                                 width:16, height:16, borderRadius:8, background:'white',
+                                 transition:'left 0.2s', display:'block' }}/>
+                </button>
+              </div>
             </div>
           )}
           {/* TOP30 옵션 */}
@@ -1234,14 +1256,23 @@ function StockTracker() {
           {/* 급등주 */}
           {!discoverLoading && discoverTab === 'surge' && ddata?.items && (
             <div>
-              <div className="px-4 py-2 mono text-[11px] text-stone-400 border-b border-stone-100">
-                주가 급등 종목 {ddata.items.length}개 · 전일 대비 등락률 높은 순
+              <div className="px-4 py-2 mono text-[11px] text-stone-400 border-b border-stone-100 flex justify-between">
+                <span>
+                  {ddata.by === 'volume' ? '거래량 급등' : '주가 급등'} 종목 {ddata.items.length}개
+                </span>
+                <span>
+                  {ddata.market === 'BOTH' ? 'KOSPI+KOSDAQ' : ddata.market} ·{' '}
+                  {ddata.by === 'volume' ? '거래량 높은 순' : '등락률 높은 순'}
+                </span>
               </div>
               {ddata.items.map((s, i) => (
                 <div key={s.c} className="flex items-stretch bg-white border-b border-stone-100">
                   <div className="w-7 flex items-center justify-center mono text-xs text-stone-300 shrink-0">{i+1}</div>
                   <div className="flex-1 min-w-0">
-                    <DiscoverStockCard s={s} extra={null}/>
+                    <DiscoverStockCard s={s}
+                      extra={ddata.by === 'volume' && s.volume > 0
+                        ? `${(s.volume/10000).toFixed(0)}만주`
+                        : null}/>
                   </div>
                 </div>
               ))}
