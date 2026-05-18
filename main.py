@@ -332,6 +332,11 @@ def _fetch_naver_current(code: str) -> dict:
     }
 
 
+@app.get("/ping")
+async def ping():
+    return {"status": "ok"}
+
+
 @app.get("/api/current/{code}")
 async def get_current_price(code: str):
     if code in _current_cache:
